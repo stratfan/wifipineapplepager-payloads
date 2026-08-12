@@ -22,15 +22,21 @@ roughly every 3-4 seconds (a fast, bounded gpsd sample - typically ~1-2s -
 plus a short window to check for the exit button press):
 
 ```
+SEQ 42
 [2026-08-11 02:38:33 UTC] FIX: 3D
 Lat/Lon: 33.464887, -86.612453
 Speed: 4.3 km/h  Heading: 184° (S)
 Sats: GPS 5/8 used  GLONASS 2/3 used
 ```
 
+Each block scrolls onto the log rather than replacing the previous one
+(the Pager's payload console doesn't support redrawing in place), so the
+incrementing **SEQ** number is there to make it obvious at a glance that
+the payload is still actively updating and hasn't frozen.
+
 Before a fix, it still shows connection and satellite state, with position,
-speed, and heading blanked. If gpsd isn't reachable, or no GPS device is
-attached, it says so instead of showing stale data.
+speed, heading, and the UTC timestamp blanked. If gpsd isn't reachable, or
+no GPS device is attached, it says so instead of showing stale data.
 
 Press **B** to exit.
 

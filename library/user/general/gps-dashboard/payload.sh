@@ -201,10 +201,23 @@ wait_for_exit() {
 }
 
 main() {
-    local raw
+    local raw block seq
+    seq=0
     while true; do
         raw="$(sample_gpsd)"
-        LOG "$(block_color "$raw")" "$(format_block "$raw")"
+        seq=$((seq + 1))
+        # SEQ is a plain incrementing counter, not a redraw - the payload
+        # console renders LOG as a scrolling feed with no way to update a
+        # previous entry in place (confirmed live: an attempt to prefix
+        # later messages with ANSI cursor-up/clear-to-end escape codes just
+        # showed up as literal garbage text, e.g. "[5A", instead of being
+        # interpreted). SEQ is the platform-safe way to show the payload is
+        # still alive and updating rather than frozen.
+        block="SEQ ${seq}
+$(format_block "$raw")"
+
+        LOG "$(block_color "$raw")" "$block"
+
         if wait_for_exit; then
             break
         fi
