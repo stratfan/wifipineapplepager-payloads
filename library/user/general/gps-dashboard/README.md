@@ -17,8 +17,9 @@ GPS currently reports without re-running a check by hand.
 
 ## Usage
 
-Run the payload. It samples gpsd roughly every 2 seconds and logs one block
-per sample:
+Run the payload. It samples gpsd and logs one block per sample, refreshing
+roughly every 3-4 seconds (a fast, bounded gpsd sample - typically ~1-2s -
+plus a short window to check for the exit button press):
 
 ```
 [2026-08-11 02:38:33 UTC] FIX: 3D

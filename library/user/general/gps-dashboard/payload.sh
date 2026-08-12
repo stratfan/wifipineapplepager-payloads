@@ -5,9 +5,14 @@
 # Version: 1.0
 # Category: general
 
-REFRESH_INTERVAL_SECS=2
+# Total cycle period per refresh ~= sampling time (bounded by
+# SAMPLE_TIMEOUT_SECS, though in practice sample_gpsd finishes well before
+# that - see its comment) + BUTTON_WAIT_SECS (the exit-check window used by
+# wait_for_exit). Empirically ~1-2s sampling + BUTTON_WAIT_SECS, i.e. a few
+# seconds total - measured live against the device, see task report.
+BUTTON_WAIT_SECS=2
 SAMPLE_TIMEOUT_SECS=3
-SAMPLE_LINES=20
+SAMPLE_LINES=8
 
 GNSS_NAMES=(GPS SBAS Galileo BeiDou IMES QZSS GLONASS)
 
@@ -56,7 +61,15 @@ format_constellation() {
     local groups=""
     while read -r gnssid used seen; do
         [ -z "$gnssid" ] && continue
-        local name="${GNSS_NAMES[$gnssid]:-GNSS$gnssid}"
+        # gnssid is used as a bash array subscript below, which evaluates it
+        # in arithmetic context - a non-numeric value (e.g. from an NMEA-fed
+        # source like mobile2gps, which doesn't always carry gnssid) would
+        # silently coerce to 0 and get mislabeled "GPS". Guard against that.
+        local name
+        case "$gnssid" in
+            ''|*[!0-9]*) name="GNSS?" ;;
+            *) name="${GNSS_NAMES[$gnssid]:-GNSS$gnssid}" ;;
+        esac
         groups+="${groups:+  }${name} ${used}/${seen} used"
     done < <(echo "$sky" | jq -r '
         .satellites // [] | group_by(.gnssid) |
@@ -109,6 +122,16 @@ format_block() {
 
     echo "[$time_disp] FIX: $fixword"
 
+    # Placeholders shared by both the mode<2 (no fix at all) and mode>=2
+    # (fix reported but this particular TPV lacks lat/lon/speed/track)
+    # cases, so the two branches can't drift out of sync with each other.
+    # The mode<2 case is the only one that legitimately means "no fix" -
+    # mode>=2 with missing fields just means the latest TPV hasn't caught
+    # up yet, so it gets a neutral "pending" wording instead of implying
+    # there's no fix when the header above already said otherwise.
+    local lat_lon_line="Lat/Lon: -- (no fix)"
+    local speed_line="Speed: --  Heading: --"
+
     if [ "$mode" -ge 2 ] 2>/dev/null; then
         local lat lon speed_ms track
         lat="$(echo "$tpv_json" | jq -r '.lat // empty' 2>/dev/null)"
@@ -117,9 +140,9 @@ format_block() {
         track="$(echo "$tpv_json" | jq -r '.track // empty' 2>/dev/null)"
 
         if [ -n "$lat" ] && [ -n "$lon" ]; then
-            echo "Lat/Lon: $lat, $lon"
+            lat_lon_line="Lat/Lon: $lat, $lon"
         else
-            echo "Lat/Lon: -- (no fix)"
+            lat_lon_line="Lat/Lon: -- (pending)"
         fi
 
         if [ -n "$speed_ms" ] && [ -n "$track" ]; then
@@ -127,34 +150,58 @@ format_block() {
             speed_kmh="$(awk -v s="$speed_ms" 'BEGIN { printf "%.1f", s * 3.6 }')"
             point="$(compass_point "$track")"
             track_int="${track%.*}"
-            echo "Speed: ${speed_kmh} km/h  Heading: ${track_int}° (${point})"
-        else
-            echo "Speed: -- Heading: --"
+            speed_line="Speed: ${speed_kmh} km/h  Heading: ${track_int}° (${point})"
         fi
-    else
-        echo "Lat/Lon: -- (no fix)"
-        echo "Speed: -- Heading: --"
     fi
+
+    echo "$lat_lon_line"
+    echo "$speed_line"
 
     format_constellation "$sky_json"
 }
 
 # Pulls one JSON sample from gpsd. Bounded independently of the button-wait
-# below so a slow/silent gpsd can't stall the refresh cadence.
+# below so a slow/silent gpsd can't stall the refresh cadence. SAMPLE_LINES
+# is tuned to capture gpsd's initial VERSION/DEVICES/WATCH burst (arrives
+# near-instantly) plus at least one full TPV+SKY pair - measured live at
+# ~1-2s typically, well under SAMPLE_TIMEOUT_SECS, which exists as a safety
+# bound for a slow/stalled connection rather than as the expected runtime.
 sample_gpsd() {
     timeout "$SAMPLE_TIMEOUT_SECS" gpspipe -w -n "$SAMPLE_LINES" 2>/dev/null
 }
 
-# Blocks until the exit button is pressed or the refresh interval elapses.
-# Returns 0 if B was pressed (caller should exit), 1 on timeout (caller
-# should refresh and loop again). Its own function, not inlined, so tests
-# can override it without needing the real WAIT_FOR_BUTTON_PRESS binary or
-# a live Pager session.
+# Blocks until the exit button is pressed or the button-wait window elapses.
+# Returns 0 if B was pressed (caller should exit), 1 if the caller should
+# refresh and loop again. Distinguishes three outcomes of the `timeout`
+# call: rc 0 means WAIT_FOR_BUTTON_PRESS returned before the window elapsed
+# (B was pressed); rc 124 is GNU coreutils' timeout exit status for "killed
+# the child after the window elapsed" (confirmed live on this device) and
+# means a normal timeout, not an error; any other rc means
+# WAIT_FOR_BUTTON_PRESS itself failed (missing/broken binary, unexpected
+# error) - that case has no external pacing at all, so this floors the loop
+# with its own sleep of BUTTON_WAIT_SECS to guarantee it can never spin
+# faster than the intended refresh cadence even in a total binary-failure
+# scenario. Its own function, not inlined, so tests can override it without
+# needing the real WAIT_FOR_BUTTON_PRESS binary or a live Pager session.
+#
+# NOTE: a B press that lands during the sampling phase (while
+# WAIT_FOR_BUTTON_PRESS isn't yet running) may register late or be missed,
+# depending on whether the Pager's eventbus queues button events - this
+# needs confirming on a real hands-on-device pass with physical buttons.
 wait_for_exit() {
-    timeout "$REFRESH_INTERVAL_SECS" WAIT_FOR_BUTTON_PRESS B >/dev/null 2>&1
+    timeout "$BUTTON_WAIT_SECS" WAIT_FOR_BUTTON_PRESS B >/dev/null 2>&1
+    local rc=$?
+    if [ "$rc" -eq 0 ]; then
+        return 0
+    elif [ "$rc" -eq 124 ]; then
+        return 1
+    fi
+    sleep "$BUTTON_WAIT_SECS"
+    return 1
 }
 
 main() {
+    local raw
     while true; do
         raw="$(sample_gpsd)"
         LOG "$(block_color "$raw")" "$(format_block "$raw")"
