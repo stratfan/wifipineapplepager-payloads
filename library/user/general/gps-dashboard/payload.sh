@@ -1,7 +1,6 @@
 #!/bin/bash
 # Title: GPS Dashboard
-# Description: Live-updating GPS status: connection/fix state, constellation
-#   breakdown, position, speed/heading, and UTC time.
+# Description: Live-updating GPS status display: connection/fix state, satellites, position, speed/heading, UTC time.
 # Author: KJ4M
 # Version: 1.0
 # Category: general
