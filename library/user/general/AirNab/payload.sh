@@ -3,7 +3,6 @@
 # Author: Hak5Darren
 # Description: Side-load Pager payloads from pending pull requests or URLs
 # Version: 1.0
-# Category: General
 
 REPO="hak5/wifipineapplepager-payloads"
 REMOTE_URL="${AIRNAB_REMOTE_URL:-https://github.com/${REPO}.git}"
@@ -501,7 +500,6 @@ url_menu() {
             "payload.sh (single file)" \
             "payload.zip (multiple files)" \
             "Back" \
-            "Exit" \
             "payload.sh (single file)") || return
 
         case "$selection" in
@@ -514,9 +512,6 @@ url_menu() {
                 return
                 ;;
             "Back")
-                return
-                ;;
-            "Exit")
                 return
                 ;;
             *)
@@ -539,8 +534,7 @@ main() {
             "Side-Load from URL" \
             "About" \
             "Exit" \
-            "Quit" \
-            "Side-Load from PR #") || exit 0
+            "Side-Load from PR #") || exit
 
         case "$selection" in
             "Side-Load from PR #")
@@ -555,10 +549,7 @@ main() {
                 PROMPT "This payload is intended for developers to side-load payloads from pending pull requests on the Hak5 WiFi Pineapple Pager payload repository, or by URL (single payload.sh file or zip containing multiple files), in the event that the payload in question is not available over-the-air from the Pager Portal"
                 ;;
             "Exit")
-                exit 0
-                ;;
-            "Quit")
-                exit 0
+                exit
                 ;;
             *)
                 LOG "Unknown selection: ${selection}"
