@@ -138,3 +138,37 @@ format_block() {
 
     format_constellation "$sky_json"
 }
+
+# Pulls one JSON sample from gpsd. Bounded independently of the button-wait
+# below so a slow/silent gpsd can't stall the refresh cadence.
+sample_gpsd() {
+    timeout "$SAMPLE_TIMEOUT_SECS" gpspipe -w -n "$SAMPLE_LINES" 2>/dev/null
+}
+
+# Blocks until the exit button is pressed or the refresh interval elapses.
+# Returns 0 if B was pressed (caller should exit), 1 on timeout (caller
+# should refresh and loop again). Its own function, not inlined, so tests
+# can override it without needing the real WAIT_FOR_BUTTON_PRESS binary or
+# a live Pager session.
+wait_for_exit() {
+    timeout "$REFRESH_INTERVAL_SECS" WAIT_FOR_BUTTON_PRESS B >/dev/null 2>&1
+}
+
+main() {
+    while true; do
+        raw="$(sample_gpsd)"
+        LOG "$(block_color "$raw")" "$(format_block "$raw")"
+        if wait_for_exit; then
+            break
+        fi
+    done
+    exit 0
+}
+
+# Only run main when this file is executed directly, not when it's sourced -
+# lets tests source it for the function definitions without triggering the
+# real loop (which would clobber any test shim of the same name - see the
+# design note above).
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+    main
+fi
