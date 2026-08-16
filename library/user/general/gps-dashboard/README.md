@@ -42,3 +42,10 @@ Press **B** to exit.
 
 This payload only displays GPS state - it doesn't restart gpsd or diagnose
 problems. If GPS isn't working at all, run **GPS Checker** first.
+
+## Hot-start caching
+
+Every fix shown here is also cached for `gps-checker` and
+`wardrive_activate` to use when they next restart gpsd, priming the
+receiver for a faster next start. This payload only writes the cache - it
+never restarts gpsd itself.
