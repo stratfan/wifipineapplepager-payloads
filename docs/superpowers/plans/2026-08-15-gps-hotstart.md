@@ -23,7 +23,7 @@
 - No test files are ever committed under `library/` — this repo ships each payload directory as-is to users (confirmed: no `tests/` directory or test file exists anywhere in repo history). All test scripts in this plan live under `/tmp/gps_hotstart_tests/` and are explicitly scratch, never `git add`ed.
 - Golden test vector (independently computed with Python's `struct` module, not hand-derived — see Task 1) for inputs `lat=33.4488935 lon=-86.9114626 alt=200.5m eph=12.3m` captured at `2026-08-15T23:05:33Z`:
   - `lat_e7=334488935 lon_e7=-869114626 alt_cm=20050 pos_acc_cm=5000 wno_or_date=2608 tow_or_time=15230533 flags=0x423(1059)`
-  - 48-byte payload as decimal bytes: `103 229 239 19 254 92 50 204 82 78 0 0 136 19 0 0 0 0 48 10 69 102 232 0 0 0 0 0 208 7 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 35 4 0 0`
+  - 48-byte payload as decimal bytes: `103 229 239 19 254 92 50 204 82 78 0 0 136 19 0 0 0 0 48 10 69 102 232 0 0 0 0 0 208 7 0 0 0 0 0 0 0 0 0 0 0 0 0 0 35 4 0 0`
   - Full 56-byte frame, hex: `b5620b01300067e5ef13fe5c32cc524e0000881300000000300a4566e80000000000d007000000000000000000000000000023040000e8d7`
   - Trivial second vector (empty-payload `AID-INI` poll, class `0x0B` id `0x01` length `0`): checksum bytes `12 47` (decimal) / `0x0C 0x2F`.
 
@@ -204,7 +204,7 @@ echo "== build_aid_ini golden vector =="
 build_aid_ini 334488935 -869114626 20050 5000 2608 15230533 2000 1059
 assert_eq "payload byte count" "48" "${#_ubx_payload_bytes[@]}"
 assert_eq "payload bytes" \
-  "103 229 239 19 254 92 50 204 82 78 0 0 136 19 0 0 0 0 48 10 69 102 232 0 0 0 0 0 208 7 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 35 4 0 0" \
+  "103 229 239 19 254 92 50 204 82 78 0 0 136 19 0 0 0 0 48 10 69 102 232 0 0 0 0 0 208 7 0 0 0 0 0 0 0 0 0 0 0 0 0 0 35 4 0 0" \
   "${_ubx_payload_bytes[*]}"
 assert_eq "frame byte count" "56" "${#_ubx_frame_bytes[@]}"
 frame_hex="$(printf '%02x' "${_ubx_frame_bytes[@]}")"
