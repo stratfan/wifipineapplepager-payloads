@@ -3,7 +3,7 @@
 **GPS Checker** tells you exactly where a stuck GPS is stuck: no data from gpsd, no satellites visible, satellites visible but not decoding, or decoding but no fix yet - and shows coordinates once a fix lands.
 
 - **Author:** mik
-- **Version:** 2.0
+- **Version:** 2.1
 
 ## Why?
 
@@ -20,3 +20,7 @@ Run the payload on the Pineapple Pager. It samples raw NMEA for a few seconds an
 - **Fix acquired** - shows latitude, longitude, altitude, and estimated accuracy.
 
 After the first check, press **[▲]** to sample again (handy after repositioning the device) or **[▼]** to exit.
+
+## Hot-start caching
+
+Every fix this payload observes is cached (position, altitude, accuracy, capture time). The next time this payload restarts gpsd, it primes the u-blox receiver with that cached fix (`UBX-AID-INI`) first, which can noticeably cut time-to-first-fix compared to a blind cold start. This is fully automatic - no setup, no new menu options. If there's no cache yet (first run) or anything about it looks wrong, this is skipped silently and gpsd restarts normally.

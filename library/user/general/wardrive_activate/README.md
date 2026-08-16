@@ -45,5 +45,13 @@ default for USB GPS devices.
 - If no GPS devices are detected, confirm the GPS is plugged in after boot.
 - If no location data appears, allow extra time for GPS lock.
 
+## Hot-start caching
+
+Before restarting gpsd, this payload primes the receiver with whatever fix
+`gps-checker` or `gps-dashboard` most recently cached, for a faster
+time-to-first-fix. If there's no cache yet, this is skipped silently and
+gpsd restarts normally.
+
 ## Changelog
+- 1.1: Adds GPS hot-start priming (UBX-AID-INI) before each gpsd restart
 - 1.0: Initial manual wardrive payload

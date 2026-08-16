@@ -1,8 +1,8 @@
 #!/bin/bash
 # Title: GPS Dashboard
-# Description: Live-updating GPS status display: connection/fix state, satellites, position, speed/heading, UTC time.
+# Description: Live-updating GPS status display: connection/fix state, satellites, position, speed/heading, UTC time. Caches fixes to help the next GPS start go faster.
 # Author: KJ4M
-# Version: 1.0
+# Version: 1.1
 # Category: general
 
 # Total cycle period per refresh ~= sampling time (bounded by
@@ -15,6 +15,31 @@ SAMPLE_TIMEOUT_SECS=3
 SAMPLE_LINES=8
 
 GNSS_NAMES=(GPS SBAS Galileo BeiDou IMES QZSS GLONASS)
+
+# --- GPS hot-start cache-writing --------------------------------------
+# Shared PAYLOAD_SET_CONFIG namespace also used by gps-checker and
+# wardrive_activate to prime the receiver for a faster next start. This
+# payload only writes the cache (it never restarts gpsd itself); see
+# gps-checker/payload.sh for the paired injector implementation and the
+# full byte-layout rationale (u-blox GPS.G7-SW-12001-B protocol spec
+# section 34.8.2). Keep this function byte-identical to the copies in
+# gps-checker - no shared library exists between payload directories on
+# this platform.
+HOTSTART_NS="gps_hotstart"
+
+cache_fix() {
+    local lat="$1" lon="$2" alt="$3" eph="$4" last now
+    [ -n "$lat" ] && [ -n "$lon" ] || return
+    last="$(PAYLOAD_GET_CONFIG "$HOTSTART_NS" "ts" 2>/dev/null)"
+    now="$(date -u +%s)"
+    case "$last" in ''|*[!0-9]*) last=0 ;; esac
+    [ "$((now - last))" -ge 60 ] || return   # rate-limit flash writes
+    PAYLOAD_SET_CONFIG "$HOTSTART_NS" "lat" "$lat" >/dev/null 2>&1
+    PAYLOAD_SET_CONFIG "$HOTSTART_NS" "lon" "$lon" >/dev/null 2>&1
+    PAYLOAD_SET_CONFIG "$HOTSTART_NS" "alt" "$alt" >/dev/null 2>&1
+    PAYLOAD_SET_CONFIG "$HOTSTART_NS" "eph" "$eph" >/dev/null 2>&1
+    PAYLOAD_SET_CONFIG "$HOTSTART_NS" "ts" "$now" >/dev/null 2>&1
+}
 
 # Maps a true-north heading in degrees to an 8-point compass letter.
 compass_point() {
@@ -141,6 +166,10 @@ format_block() {
 
         if [ -n "$lat" ] && [ -n "$lon" ]; then
             lat_lon_line="Lat/Lon: $lat, $lon"
+            local cache_alt cache_eph
+            cache_alt="$(echo "$tpv_json" | jq -r '.altHAE // .altMSL // .alt // empty' 2>/dev/null)"
+            cache_eph="$(echo "$tpv_json" | jq -r '.eph // empty' 2>/dev/null)"
+            cache_fix "$lat" "$lon" "$cache_alt" "$cache_eph"
         else
             lat_lon_line="Lat/Lon: -- (pending)"
         fi
