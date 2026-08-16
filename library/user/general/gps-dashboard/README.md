@@ -5,7 +5,7 @@ currently knows: connection/fix status, satellite constellation breakdown,
 position, speed and heading, and UTC time.
 
 - **Author:** KJ4M
-- **Version:** 1.0
+- **Version:** 1.1
 
 ## Why?
 

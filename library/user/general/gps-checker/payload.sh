@@ -114,13 +114,17 @@ resolve_gps_device() {
 # Caches the last known fix for the next hot-start injection. No-op if lat
 # or lon is empty (nothing usable to cache).
 cache_fix() {
-    local lat="$1" lon="$2" alt="$3" eph="$4"
+    local lat="$1" lon="$2" alt="$3" eph="$4" last now
     [ -n "$lat" ] && [ -n "$lon" ] || return
+    last="$(PAYLOAD_GET_CONFIG "$HOTSTART_NS" "ts" 2>/dev/null)"
+    now="$(date -u +%s)"
+    case "$last" in ''|*[!0-9]*) last=0 ;; esac
+    [ "$((now - last))" -ge 60 ] || return   # rate-limit flash writes
     PAYLOAD_SET_CONFIG "$HOTSTART_NS" "lat" "$lat" >/dev/null 2>&1
     PAYLOAD_SET_CONFIG "$HOTSTART_NS" "lon" "$lon" >/dev/null 2>&1
     PAYLOAD_SET_CONFIG "$HOTSTART_NS" "alt" "$alt" >/dev/null 2>&1
     PAYLOAD_SET_CONFIG "$HOTSTART_NS" "eph" "$eph" >/dev/null 2>&1
-    PAYLOAD_SET_CONFIG "$HOTSTART_NS" "ts" "$(date -u +%s)" >/dev/null 2>&1
+    PAYLOAD_SET_CONFIG "$HOTSTART_NS" "ts" "$now" >/dev/null 2>&1
 }
 
 # Reads the cached fix (if any) and injects UBX-AID-INI to $1 (a resolved
@@ -155,16 +159,13 @@ inject_hotstart() {
 
     local flags=$((0x1 | 0x20))   # pos + lla
     local wno_or_date=0 tow_or_time=0 t_acc_ms=0
-    local year
-    year="$(date -u +%Y)"
+    local year month day hour min sec
+    read -r year month day hour min sec <<< "$(date -u '+%Y %m %d %H %M %S')"
+    year=$((10#$year))
     if [ "$year" -ge 2020 ] 2>/dev/null && [ "$year" -le 2035 ] 2>/dev/null; then
         flags=$((flags | 0x2 | 0x400))   # time + utc
-        local month day hour min sec
-        month="$(date -u +%m)"; month=$((10#$month))
-        day="$(date -u +%d)"; day=$((10#$day))
-        hour="$(date -u +%H)"; hour=$((10#$hour))
-        min="$(date -u +%M)"; min=$((10#$min))
-        sec="$(date -u +%S)"; sec=$((10#$sec))
+        month=$((10#$month)); day=$((10#$day)); hour=$((10#$hour))
+        min=$((10#$min)); sec=$((10#$sec))
         wno_or_date=$(( (year - 2000) * 100 + month ))
         tow_or_time=$(( day * 1000000 + hour * 10000 + min * 100 + sec ))
         t_acc_ms=2000
@@ -176,10 +177,27 @@ inject_hotstart() {
     [ -c "$device" ] || [ -f "$device" ] || return 1
     local baud
     baud="$(uci -q get gpsd.core.speed)"
-    [ -n "$baud" ] && stty -F "$device" "$baud" raw 2>/dev/null
+    stty -F "$device" ${baud:+"$baud"} raw clocal -echo 2>/dev/null
 
-    ubx_write_frame "$device" 2>/dev/null || return 1
-    return 0
+    # `timeout N ubx_write_frame ...` cannot work: ubx_write_frame is a
+    # bash function, not an executable, and timeout always execve()s its
+    # target directly rather than going through a shell, so it can never
+    # find a shell function by name. Bound the write with a pure-bash
+    # background job + watchdog kill instead - a backgrounded job is
+    # forked, not exec'd, so it inherits the full function table and
+    # variable state (including the _ubx_frame_bytes array build_aid_ini
+    # just populated).
+    local wpid kpid
+    ubx_write_frame "$device" 2>/dev/null &
+    wpid=$!
+    ( sleep 2; kill -9 "$wpid" 2>/dev/null ) 2>/dev/null &
+    kpid=$!
+    if wait "$wpid" 2>/dev/null; then
+        kill "$kpid" 2>/dev/null; wait "$kpid" 2>/dev/null
+        return 0
+    fi
+    kill "$kpid" 2>/dev/null; wait "$kpid" 2>/dev/null
+    return 1
 }
 
 # Restarts gpsd once, giving the device a moment to settle.
@@ -187,9 +205,12 @@ restart_gpsd() {
     LOG yellow "Restarting gpsd..."
     local device
     if device="$(resolve_gps_device)"; then
+        trap 'service gpsd start' EXIT INT TERM
         service gpsd stop
         inject_hotstart "$device"
+        sleep 0.5
         service gpsd start
+        trap - EXIT INT TERM
     else
         service gpsd restart
     fi
@@ -242,7 +263,7 @@ show_coordinates() {
     # Cache this fix for the next gpsd restart's hot-start injection - uses
     # its own "empty" defaults (not the "n/a" display placeholders above).
     local cache_alt cache_eph
-    cache_alt="$(echo "$tpv_json" | jq -r '.altMSL // .alt // empty' 2>/dev/null)"
+    cache_alt="$(echo "$tpv_json" | jq -r '.altHAE // .altMSL // .alt // empty' 2>/dev/null)"
     cache_eph="$(echo "$tpv_json" | jq -r '.eph // empty' 2>/dev/null)"
     cache_fix "$lat" "$lon" "$cache_alt" "$cache_eph"
 }

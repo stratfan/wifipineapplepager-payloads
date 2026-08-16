@@ -53,4 +53,5 @@ time-to-first-fix. If there's no cache yet, this is skipped silently and
 gpsd restarts normally.
 
 ## Changelog
+- 1.1: Adds GPS hot-start priming (UBX-AID-INI) before each gpsd restart
 - 1.0: Initial manual wardrive payload

@@ -12,8 +12,8 @@
 # cache) - see gps-checker/payload.sh for the paired cache_fix writer and
 # the full byte-layout rationale (u-blox GPS.G7-SW-12001-B protocol spec
 # section 34.8.2). Keep these functions byte-identical to the copies in
-# gps-checker and gps-dashboard - no shared library exists between payload
-# directories on this platform.
+# gps-checker - no shared library exists between payload directories on
+# this platform.
 HOTSTART_NS="gps_hotstart"
 
 _ubx_append_le() {
@@ -108,18 +108,15 @@ inject_hotstart() {
             ;;
     esac
 
-    local flags=$((0x1 | 0x20))
+    local flags=$((0x1 | 0x20))   # pos + lla
     local wno_or_date=0 tow_or_time=0 t_acc_ms=0
-    local year
-    year="$(date -u +%Y)"
+    local year month day hour min sec
+    read -r year month day hour min sec <<< "$(date -u '+%Y %m %d %H %M %S')"
+    year=$((10#$year))
     if [ "$year" -ge 2020 ] 2>/dev/null && [ "$year" -le 2035 ] 2>/dev/null; then
-        flags=$((flags | 0x2 | 0x400))
-        local month day hour min sec
-        month="$(date -u +%m)"; month=$((10#$month))
-        day="$(date -u +%d)"; day=$((10#$day))
-        hour="$(date -u +%H)"; hour=$((10#$hour))
-        min="$(date -u +%M)"; min=$((10#$min))
-        sec="$(date -u +%S)"; sec=$((10#$sec))
+        flags=$((flags | 0x2 | 0x400))   # time + utc
+        month=$((10#$month)); day=$((10#$day)); hour=$((10#$hour))
+        min=$((10#$min)); sec=$((10#$sec))
         wno_or_date=$(( (year - 2000) * 100 + month ))
         tow_or_time=$(( day * 1000000 + hour * 10000 + min * 100 + sec ))
         t_acc_ms=2000
@@ -131,10 +128,27 @@ inject_hotstart() {
     [ -c "$device" ] || [ -f "$device" ] || return 1
     local baud
     baud="$(uci -q get gpsd.core.speed)"
-    [ -n "$baud" ] && stty -F "$device" "$baud" raw 2>/dev/null
+    stty -F "$device" ${baud:+"$baud"} raw clocal -echo 2>/dev/null
 
-    ubx_write_frame "$device" 2>/dev/null || return 1
-    return 0
+    # `timeout N ubx_write_frame ...` cannot work: ubx_write_frame is a
+    # bash function, not an executable, and timeout always execve()s its
+    # target directly rather than going through a shell, so it can never
+    # find a shell function by name. Bound the write with a pure-bash
+    # background job + watchdog kill instead - a backgrounded job is
+    # forked, not exec'd, so it inherits the full function table and
+    # variable state (including the _ubx_frame_bytes array build_aid_ini
+    # just populated).
+    local wpid kpid
+    ubx_write_frame "$device" 2>/dev/null &
+    wpid=$!
+    ( sleep 2; kill -9 "$wpid" 2>/dev/null ) 2>/dev/null &
+    kpid=$!
+    if wait "$wpid" 2>/dev/null; then
+        kill "$kpid" 2>/dev/null; wait "$kpid" 2>/dev/null
+        return 0
+    fi
+    kill "$kpid" 2>/dev/null; wait "$kpid" 2>/dev/null
+    return 1
 }
 
 # =============================================================================
@@ -312,9 +326,12 @@ LOG "Restarting gpsd..."
 # receiver with the last known fix first when one is cached (see
 # inject_hotstart above) for a faster time-to-first-fix. selected_device
 # is already a validated character device by this point (checked above).
+trap '/etc/init.d/gpsd start' EXIT INT TERM
 /etc/init.d/gpsd stop
 inject_hotstart "$selected_device"
+sleep 0.5
 /etc/init.d/gpsd start
+trap - EXIT INT TERM
 
 # Enable Wigle logging now that GPS is configured (no uploads are performed).
 LOG "Enabling Wigle logging..."

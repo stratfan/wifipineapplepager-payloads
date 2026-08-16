@@ -3,7 +3,7 @@
 **GPS Checker** tells you exactly where a stuck GPS is stuck: no data from gpsd, no satellites visible, satellites visible but not decoding, or decoding but no fix yet - and shows coordinates once a fix lands.
 
 - **Author:** mik
-- **Version:** 2.0
+- **Version:** 2.1
 
 ## Why?
 

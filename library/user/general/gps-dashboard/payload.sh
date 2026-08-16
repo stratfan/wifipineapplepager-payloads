@@ -23,18 +23,22 @@ GNSS_NAMES=(GPS SBAS Galileo BeiDou IMES QZSS GLONASS)
 # gps-checker/payload.sh for the paired injector implementation and the
 # full byte-layout rationale (u-blox GPS.G7-SW-12001-B protocol spec
 # section 34.8.2). Keep this function byte-identical to the copies in
-# gps-checker and wardrive_activate - no shared library exists between
-# payload directories on this platform.
+# gps-checker - no shared library exists between payload directories on
+# this platform.
 HOTSTART_NS="gps_hotstart"
 
 cache_fix() {
-    local lat="$1" lon="$2" alt="$3" eph="$4"
+    local lat="$1" lon="$2" alt="$3" eph="$4" last now
     [ -n "$lat" ] && [ -n "$lon" ] || return
+    last="$(PAYLOAD_GET_CONFIG "$HOTSTART_NS" "ts" 2>/dev/null)"
+    now="$(date -u +%s)"
+    case "$last" in ''|*[!0-9]*) last=0 ;; esac
+    [ "$((now - last))" -ge 60 ] || return   # rate-limit flash writes
     PAYLOAD_SET_CONFIG "$HOTSTART_NS" "lat" "$lat" >/dev/null 2>&1
     PAYLOAD_SET_CONFIG "$HOTSTART_NS" "lon" "$lon" >/dev/null 2>&1
     PAYLOAD_SET_CONFIG "$HOTSTART_NS" "alt" "$alt" >/dev/null 2>&1
     PAYLOAD_SET_CONFIG "$HOTSTART_NS" "eph" "$eph" >/dev/null 2>&1
-    PAYLOAD_SET_CONFIG "$HOTSTART_NS" "ts" "$(date -u +%s)" >/dev/null 2>&1
+    PAYLOAD_SET_CONFIG "$HOTSTART_NS" "ts" "$now" >/dev/null 2>&1
 }
 
 # Maps a true-north heading in degrees to an 8-point compass letter.
@@ -163,7 +167,7 @@ format_block() {
         if [ -n "$lat" ] && [ -n "$lon" ]; then
             lat_lon_line="Lat/Lon: $lat, $lon"
             local cache_alt cache_eph
-            cache_alt="$(echo "$tpv_json" | jq -r '.altMSL // .alt // empty' 2>/dev/null)"
+            cache_alt="$(echo "$tpv_json" | jq -r '.altHAE // .altMSL // .alt // empty' 2>/dev/null)"
             cache_eph="$(echo "$tpv_json" | jq -r '.eph // empty' 2>/dev/null)"
             cache_fix "$lat" "$lon" "$cache_alt" "$cache_eph"
         else
