@@ -224,11 +224,11 @@ _ttff_write_result_line() {
     echo "${ts} ${payload_name} injected=${injected} ttff=${ttff_field}" >> "$TTFF_LOG_FILE" 2>/dev/null
 }
 
-# Kills any still-alive poller recorded in TTFF_PID_FILE, then records $1
-# (the new poller's PID) there. Prevents overlapping pollers stacking up
-# when gpsd is restarted more than once in a session.
-_ttff_guard_poller() {
-    local new_pid="$1" old_pid
+# Kills any still-alive poller recorded in TTFF_PID_FILE. Call BEFORE
+# spawning a new poller, so a stale poller is never left running
+# concurrently with a fresh one.
+_ttff_kill_previous_poller() {
+    local old_pid
     if [ -f "$TTFF_PID_FILE" ]; then
         old_pid="$(cat "$TTFF_PID_FILE" 2>/dev/null)"
         case "$old_pid" in
@@ -236,7 +236,12 @@ _ttff_guard_poller() {
             *) kill -0 "$old_pid" 2>/dev/null && kill "$old_pid" 2>/dev/null ;;
         esac
     fi
-    echo "$new_pid" > "$TTFF_PID_FILE" 2>/dev/null
+}
+
+# Records $1 (a poller's PID) in TTFF_PID_FILE. Call AFTER spawning the
+# poller, once its real PID ($!) is known.
+_ttff_record_poller_pid() {
+    echo "$1" > "$TTFF_PID_FILE" 2>/dev/null
 }
 
 # Polls gpsd for a 3D fix and logs the result. $1=payload name literal,
@@ -259,11 +264,13 @@ _ttff_poll_and_log() {
 
 # Spawns the background TTFF poller. $1=payload name literal (e.g.
 # "gps-checker"), $2=injected (yes|no). Call immediately after gpsd has
-# been (re)started - never blocks the caller.
+# been (re)started - never blocks the caller. Kills any still-running
+# previous poller first, so pollers never overlap.
 start_ttff_poller() {
     local payload_name="$1" injected="$2"
+    _ttff_kill_previous_poller
     _ttff_poll_and_log "$payload_name" "$injected" &
-    _ttff_guard_poller "$!"
+    _ttff_record_poller_pid "$!"
 }
 
 # Restarts gpsd once, giving the device a moment to settle.
