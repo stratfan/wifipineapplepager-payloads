@@ -33,9 +33,10 @@
 - Produces (for Task 2 to duplicate verbatim, and for Task 3 to exercise on-device):
   - Globals: `TTFF_LOG_FILE` (default `/root/wardrive_ttff.log`), `TTFF_PID_FILE` (default `/tmp/ttff_poller.pid`), `TTFF_POLL_INTERVAL` (default `5`), `TTFF_POLL_TIMEOUT` (default `600`) — all overridable via pre-set environment variables (`"${VAR:-default}"`), which is how tests override them.
   - `_ttff_write_result_line(payload_name, injected, result)` — `result` is either a plain integer (elapsed seconds) or the literal string `timeout`. Appends one formatted line to `$TTFF_LOG_FILE`.
-  - `_ttff_guard_poller(new_pid)` — kills any live PID currently in `$TTFF_PID_FILE`, then writes `new_pid` there.
+  - `_ttff_kill_previous_poller()` — kills any live PID currently in `$TTFF_PID_FILE`, if any. Takes no arguments; call BEFORE spawning a new poller.
+  - `_ttff_record_poller_pid(pid)` — writes `pid` to `$TTFF_PID_FILE`. Call AFTER spawning, once the new poller's real PID (`$!`) is known.
   - `_ttff_poll_and_log(payload_name, injected)` — blocking; polls up to `$TTFF_POLL_TIMEOUT`, calls `_ttff_write_result_line` with the outcome. Never call this directly except backgrounded.
-  - `start_ttff_poller(payload_name, injected)` — backgrounds `_ttff_poll_and_log`, then calls `_ttff_guard_poller` with its PID. This is the only entry point callers use.
+  - `start_ttff_poller(payload_name, injected)` — kills any previous poller first, backgrounds `_ttff_poll_and_log`, then records its PID. This is the only entry point callers use.
 
 - [ ] **Step 1: Confirm the exact insertion point**
 
@@ -105,21 +106,21 @@ assert_eq "two appended lines" \
 2026-08-19T04:23:32Z gps-checker injected=no ttff=20s" \
     "$(cat "$TTFF_LOG_FILE")"
 
-echo "== _ttff_guard_poller: dead PID is not killed, new PID recorded =="
+echo "== _ttff_kill_previous_poller: dead PID is left alone, no error =="
 TTFF_PID_FILE=/tmp/gps_ttff_tests/dead.pid
 sh -c 'exit 0' &
 dead_pid=$!
 wait "$dead_pid" 2>/dev/null
 echo "$dead_pid" > "$TTFF_PID_FILE"
-_ttff_guard_poller 999
-assert_eq "pid file updated after dead-pid guard" "999" "$(cat "$TTFF_PID_FILE")"
+_ttff_kill_previous_poller
+echo "PASS: _ttff_kill_previous_poller completed without error on a dead PID"
 
-echo "== _ttff_guard_poller: live PID is killed, new PID recorded =="
+echo "== _ttff_kill_previous_poller: live PID is killed =="
 TTFF_PID_FILE=/tmp/gps_ttff_tests/live.pid
 sleep 30 &
 live_pid=$!
 echo "$live_pid" > "$TTFF_PID_FILE"
-_ttff_guard_poller 888
+_ttff_kill_previous_poller
 sleep 0.2
 if kill -0 "$live_pid" 2>/dev/null; then
     echo "FAIL: previous live poller was not killed"
@@ -128,7 +129,12 @@ if kill -0 "$live_pid" 2>/dev/null; then
 else
     echo "PASS: previous live poller was killed"
 fi
-assert_eq "pid file updated after live-pid guard" "888" "$(cat "$TTFF_PID_FILE")"
+
+echo "== _ttff_record_poller_pid: writes the given PID to TTFF_PID_FILE =="
+TTFF_PID_FILE=/tmp/gps_ttff_tests/record.pid
+rm -f "$TTFF_PID_FILE"
+_ttff_record_poller_pid 777
+assert_eq "pid file contains the recorded pid" "777" "$(cat "$TTFF_PID_FILE")"
 
 echo "== start_ttff_poller: spawns a background job, records its PID, logs on timeout =="
 TTFF_LOG_FILE=/tmp/gps_ttff_tests/out_spawn.log
@@ -141,6 +147,35 @@ start_ttff_poller "gps-checker" "no"
 poller_pid="$(cat "$TTFF_PID_FILE")"
 wait "$poller_pid" 2>/dev/null
 assert_eq "spawned poller logged a timeout line" \
+    "2026-08-19T04:23:32Z gps-checker injected=no ttff=timeout(1s)" \
+    "$(cat "$TTFF_LOG_FILE")"
+
+echo "== start_ttff_poller: kills a still-live previous poller BEFORE recording the new PID =="
+TTFF_LOG_FILE=/tmp/gps_ttff_tests/out_order.log
+TTFF_PID_FILE=/tmp/gps_ttff_tests/order.pid
+TTFF_POLL_TIMEOUT=1
+TTFF_POLL_INTERVAL=1
+rm -f "$TTFF_LOG_FILE" "$TTFF_PID_FILE"
+sleep 30 &
+old_live_pid=$!
+echo "$old_live_pid" > "$TTFF_PID_FILE"
+gpspipe() { :; }
+start_ttff_poller "gps-checker" "no"
+new_pid="$(cat "$TTFF_PID_FILE")"
+if [ "$new_pid" = "$old_live_pid" ]; then
+    echo "FAIL: pid file still holds the old poller's pid"
+    kill "$old_live_pid" 2>/dev/null
+    exit 1
+fi
+if kill -0 "$old_live_pid" 2>/dev/null; then
+    echo "FAIL: old poller was not killed by start_ttff_poller"
+    kill "$old_live_pid" "$new_pid" 2>/dev/null
+    exit 1
+else
+    echo "PASS: old poller was killed and pid file now holds the new poller's pid"
+fi
+wait "$new_pid" 2>/dev/null
+assert_eq "new poller logged a timeout line" \
     "2026-08-19T04:23:32Z gps-checker injected=no ttff=timeout(1s)" \
     "$(cat "$TTFF_LOG_FILE")"
 
@@ -181,11 +216,11 @@ _ttff_write_result_line() {
     echo "${ts} ${payload_name} injected=${injected} ttff=${ttff_field}" >> "$TTFF_LOG_FILE" 2>/dev/null
 }
 
-# Kills any still-alive poller recorded in TTFF_PID_FILE, then records $1
-# (the new poller's PID) there. Prevents overlapping pollers stacking up
-# when gpsd is restarted more than once in a session.
-_ttff_guard_poller() {
-    local new_pid="$1" old_pid
+# Kills any still-alive poller recorded in TTFF_PID_FILE. Call BEFORE
+# spawning a new poller, so a stale poller is never left running
+# concurrently with a fresh one.
+_ttff_kill_previous_poller() {
+    local old_pid
     if [ -f "$TTFF_PID_FILE" ]; then
         old_pid="$(cat "$TTFF_PID_FILE" 2>/dev/null)"
         case "$old_pid" in
@@ -193,7 +228,12 @@ _ttff_guard_poller() {
             *) kill -0 "$old_pid" 2>/dev/null && kill "$old_pid" 2>/dev/null ;;
         esac
     fi
-    echo "$new_pid" > "$TTFF_PID_FILE" 2>/dev/null
+}
+
+# Records $1 (a poller's PID) in TTFF_PID_FILE. Call AFTER spawning the
+# poller, once its real PID ($!) is known.
+_ttff_record_poller_pid() {
+    echo "$1" > "$TTFF_PID_FILE" 2>/dev/null
 }
 
 # Polls gpsd for a 3D fix and logs the result. $1=payload name literal,
@@ -216,11 +256,13 @@ _ttff_poll_and_log() {
 
 # Spawns the background TTFF poller. $1=payload name literal (e.g.
 # "gps-checker"), $2=injected (yes|no). Call immediately after gpsd has
-# been (re)started - never blocks the caller.
+# been (re)started - never blocks the caller. Kills any still-running
+# previous poller first, so pollers never overlap.
 start_ttff_poller() {
     local payload_name="$1" injected="$2"
+    _ttff_kill_previous_poller
     _ttff_poll_and_log "$payload_name" "$injected" &
-    _ttff_guard_poller "$!"
+    _ttff_record_poller_pid "$!"
 }
 
 ```
@@ -303,7 +345,7 @@ git commit -m "feat(gps-checker): log time-to-first-fix after gpsd restart"
 - Test: `/tmp/gps_ttff_tests/test_wardrive_activate.sh`
 
 **Interfaces:**
-- Consumes: nothing from Task 1 — `wardrive_activate/payload.sh` is a separate file and gets its own verbatim copy of the same four functions (`_ttff_write_result_line`, `_ttff_guard_poller`, `_ttff_poll_and_log`, `start_ttff_poller`) with identical names, signatures, and behavior to Task 1's. Do not rename or reshape them — the log format and globals must match exactly so both payloads write compatible lines to the same shared file.
+- Consumes: nothing from Task 1 — `wardrive_activate/payload.sh` is a separate file and gets its own verbatim copy of the same five functions (`_ttff_write_result_line`, `_ttff_kill_previous_poller`, `_ttff_record_poller_pid`, `_ttff_poll_and_log`, `start_ttff_poller`) with identical names, signatures, and behavior to Task 1's. Do not rename or reshape them — the log format and globals must match exactly so both payloads write compatible lines to the same shared file.
 - Produces: nothing new for later tasks; Task 3 exercises both payloads' `start_ttff_poller` on real hardware.
 
 - [ ] **Step 1: Confirm the exact insertion points**
@@ -366,21 +408,21 @@ assert_eq "timeout line content" \
     "2026-08-19T04:23:32Z wardrive_activate injected=no ttff=timeout(600s)" \
     "$(cat "$TTFF_LOG_FILE")"
 
-echo "== _ttff_guard_poller: dead PID is not killed, new PID recorded =="
+echo "== _ttff_kill_previous_poller: dead PID is left alone, no error =="
 TTFF_PID_FILE=/tmp/gps_ttff_tests/wa_dead.pid
 sh -c 'exit 0' &
 dead_pid=$!
 wait "$dead_pid" 2>/dev/null
 echo "$dead_pid" > "$TTFF_PID_FILE"
-_ttff_guard_poller 999
-assert_eq "pid file updated after dead-pid guard" "999" "$(cat "$TTFF_PID_FILE")"
+_ttff_kill_previous_poller
+echo "PASS: _ttff_kill_previous_poller completed without error on a dead PID"
 
-echo "== _ttff_guard_poller: live PID is killed, new PID recorded =="
+echo "== _ttff_kill_previous_poller: live PID is killed =="
 TTFF_PID_FILE=/tmp/gps_ttff_tests/wa_live.pid
 sleep 30 &
 live_pid=$!
 echo "$live_pid" > "$TTFF_PID_FILE"
-_ttff_guard_poller 888
+_ttff_kill_previous_poller
 sleep 0.2
 if kill -0 "$live_pid" 2>/dev/null; then
     echo "FAIL: previous live poller was not killed"
@@ -389,7 +431,12 @@ if kill -0 "$live_pid" 2>/dev/null; then
 else
     echo "PASS: previous live poller was killed"
 fi
-assert_eq "pid file updated after live-pid guard" "888" "$(cat "$TTFF_PID_FILE")"
+
+echo "== _ttff_record_poller_pid: writes the given PID to TTFF_PID_FILE =="
+TTFF_PID_FILE=/tmp/gps_ttff_tests/wa_record.pid
+rm -f "$TTFF_PID_FILE"
+_ttff_record_poller_pid 777
+assert_eq "pid file contains the recorded pid" "777" "$(cat "$TTFF_PID_FILE")"
 
 echo "== start_ttff_poller: spawns a background job, records its PID, logs on timeout =="
 TTFF_LOG_FILE=/tmp/gps_ttff_tests/wa_out_spawn.log
@@ -402,6 +449,35 @@ start_ttff_poller "wardrive_activate" "no"
 poller_pid="$(cat "$TTFF_PID_FILE")"
 wait "$poller_pid" 2>/dev/null
 assert_eq "spawned poller logged a timeout line" \
+    "2026-08-19T04:23:32Z wardrive_activate injected=no ttff=timeout(1s)" \
+    "$(cat "$TTFF_LOG_FILE")"
+
+echo "== start_ttff_poller: kills a still-live previous poller BEFORE recording the new PID =="
+TTFF_LOG_FILE=/tmp/gps_ttff_tests/wa_out_order.log
+TTFF_PID_FILE=/tmp/gps_ttff_tests/wa_order.pid
+TTFF_POLL_TIMEOUT=1
+TTFF_POLL_INTERVAL=1
+rm -f "$TTFF_LOG_FILE" "$TTFF_PID_FILE"
+sleep 30 &
+old_live_pid=$!
+echo "$old_live_pid" > "$TTFF_PID_FILE"
+gpspipe() { :; }
+start_ttff_poller "wardrive_activate" "no"
+new_pid="$(cat "$TTFF_PID_FILE")"
+if [ "$new_pid" = "$old_live_pid" ]; then
+    echo "FAIL: pid file still holds the old poller's pid"
+    kill "$old_live_pid" 2>/dev/null
+    exit 1
+fi
+if kill -0 "$old_live_pid" 2>/dev/null; then
+    echo "FAIL: old poller was not killed by start_ttff_poller"
+    kill "$old_live_pid" "$new_pid" 2>/dev/null
+    exit 1
+else
+    echo "PASS: old poller was killed and pid file now holds the new poller's pid"
+fi
+wait "$new_pid" 2>/dev/null
+assert_eq "new poller logged a timeout line" \
     "2026-08-19T04:23:32Z wardrive_activate injected=no ttff=timeout(1s)" \
     "$(cat "$TTFF_LOG_FILE")"
 
@@ -442,11 +518,11 @@ _ttff_write_result_line() {
     echo "${ts} ${payload_name} injected=${injected} ttff=${ttff_field}" >> "$TTFF_LOG_FILE" 2>/dev/null
 }
 
-# Kills any still-alive poller recorded in TTFF_PID_FILE, then records $1
-# (the new poller's PID) there. Prevents overlapping pollers stacking up
-# when gpsd is restarted more than once in a session.
-_ttff_guard_poller() {
-    local new_pid="$1" old_pid
+# Kills any still-alive poller recorded in TTFF_PID_FILE. Call BEFORE
+# spawning a new poller, so a stale poller is never left running
+# concurrently with a fresh one.
+_ttff_kill_previous_poller() {
+    local old_pid
     if [ -f "$TTFF_PID_FILE" ]; then
         old_pid="$(cat "$TTFF_PID_FILE" 2>/dev/null)"
         case "$old_pid" in
@@ -454,7 +530,12 @@ _ttff_guard_poller() {
             *) kill -0 "$old_pid" 2>/dev/null && kill "$old_pid" 2>/dev/null ;;
         esac
     fi
-    echo "$new_pid" > "$TTFF_PID_FILE" 2>/dev/null
+}
+
+# Records $1 (a poller's PID) in TTFF_PID_FILE. Call AFTER spawning the
+# poller, once its real PID ($!) is known.
+_ttff_record_poller_pid() {
+    echo "$1" > "$TTFF_PID_FILE" 2>/dev/null
 }
 
 # Polls gpsd for a 3D fix and logs the result. $1=payload name literal,
@@ -477,11 +558,13 @@ _ttff_poll_and_log() {
 
 # Spawns the background TTFF poller. $1=payload name literal (e.g.
 # "gps-checker"), $2=injected (yes|no). Call immediately after gpsd has
-# been (re)started - never blocks the caller.
+# been (re)started - never blocks the caller. Kills any still-running
+# previous poller first, so pollers never overlap.
 start_ttff_poller() {
     local payload_name="$1" injected="$2"
+    _ttff_kill_previous_poller
     _ttff_poll_and_log "$payload_name" "$injected" &
-    _ttff_guard_poller "$!"
+    _ttff_record_poller_pid "$!"
 }
 
 ```
