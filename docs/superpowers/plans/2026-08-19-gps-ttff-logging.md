@@ -84,7 +84,6 @@ date() {
 # run_check/while-loop (added during the hot-start feature), so sourcing
 # it here only defines functions - no side effects, no fakes needed for
 # LOG/service/uci/etc.
-#
 source /Users/eighmy/repos/PineapplePager/payloads/library/user/general/gps-checker/payload.sh
 
 echo "== _ttff_write_result_line: success case =="
@@ -267,17 +266,24 @@ else
     echo "PASS: logged ttff=${logged_ttff}s reflects real wall-clock time (measured ${real_elapsed}s)"
 fi
 
-echo "== _ttff_poll_and_log: clears TTFF_PID_FILE on exit if it still names this process =="
+echo "== _ttff_poll_and_log: clears TTFF_PID_FILE on exit via the real backgrounded path =="
+# Must go through start_ttff_poller, not call _ttff_poll_and_log directly:
+# a direct foreground call never forks, so $$ inside it trivially equals
+# the caller's own pid regardless of whether _ttff_clear_own_pid compares
+# against $$ or $BASHPID - it can't distinguish the two, so it can't catch
+# a $$-vs-$BASHPID bug. start_ttff_poller's real `&` backgrounding is the
+# only path where $$ (invoking shell) and $BASHPID (the forked job) differ.
 TTFF_LOG_FILE=/tmp/gps_ttff_tests/pidclear.log
 TTFF_PID_FILE=/tmp/gps_ttff_tests/pidclear.pid
 TTFF_POLL_TIMEOUT=1
 TTFF_POLL_INTERVAL=1
 rm -f "$TTFF_LOG_FILE" "$TTFF_PID_FILE"
 gpspipe() { :; }  # no fix ever arrives - forces the timeout path
-echo "$$" > "$TTFF_PID_FILE"   # simulate this process having recorded its own pid
-_ttff_poll_and_log "gps-checker" "no"
+start_ttff_poller "gps-checker" "no"
+poller_pid="$(cat "$TTFF_PID_FILE")"
+wait "$poller_pid" 2>/dev/null
 if [ -f "$TTFF_PID_FILE" ]; then
-    echo "FAIL: TTFF_PID_FILE still exists after _ttff_poll_and_log exited (stale PID left behind)"
+    echo "FAIL: TTFF_PID_FILE still exists after the backgrounded poller exited (stale PID left behind)"
     exit 1
 else
     echo "PASS: TTFF_PID_FILE was cleared on exit"
@@ -352,8 +358,13 @@ _ttff_record_poller_pid() {
 # path of _ttff_poll_and_log so a finished poller never leaves a stale PID
 # behind - an uncleared stale PID risks the OS eventually reusing it for
 # an unrelated process, which _ttff_kill_previous_poller would then kill.
+# Compares against $BASHPID, not $$: this function always runs inside the
+# backgrounded subshell start_ttff_poller spawns, where $$ still reports
+# the invoking shell's PID rather than the job's own - $BASHPID (which is
+# what $! captures in the parent, and what TTFF_PID_FILE actually holds)
+# is the only one that matches here.
 _ttff_clear_own_pid() {
-    [ "$(cat "$TTFF_PID_FILE" 2>/dev/null)" = "$$" ] && rm -f "$TTFF_PID_FILE"
+    [ "$(cat "$TTFF_PID_FILE" 2>/dev/null)" = "$BASHPID" ] && rm -f "$TTFF_PID_FILE"
 }
 
 # Polls gpsd for a 3D fix and logs the result. $1=payload name literal,
@@ -703,17 +714,24 @@ else
     echo "PASS: logged ttff=${logged_ttff}s reflects real wall-clock time (measured ${real_elapsed}s)"
 fi
 
-echo "== _ttff_poll_and_log: clears TTFF_PID_FILE on exit if it still names this process =="
+echo "== _ttff_poll_and_log: clears TTFF_PID_FILE on exit via the real backgrounded path =="
+# Must go through start_ttff_poller, not call _ttff_poll_and_log directly:
+# a direct foreground call never forks, so $$ inside it trivially equals
+# the caller's own pid regardless of whether _ttff_clear_own_pid compares
+# against $$ or $BASHPID - it can't distinguish the two, so it can't catch
+# a $$-vs-$BASHPID bug. start_ttff_poller's real `&` backgrounding is the
+# only path where $$ (invoking shell) and $BASHPID (the forked job) differ.
 TTFF_LOG_FILE=/tmp/gps_ttff_tests/wa_pidclear.log
 TTFF_PID_FILE=/tmp/gps_ttff_tests/wa_pidclear.pid
 TTFF_POLL_TIMEOUT=1
 TTFF_POLL_INTERVAL=1
 rm -f "$TTFF_LOG_FILE" "$TTFF_PID_FILE"
 gpspipe() { :; }  # no fix ever arrives - forces the timeout path
-echo "$$" > "$TTFF_PID_FILE"   # simulate this process having recorded its own pid
-_ttff_poll_and_log "wardrive_activate" "no"
+start_ttff_poller "wardrive_activate" "no"
+poller_pid="$(cat "$TTFF_PID_FILE")"
+wait "$poller_pid" 2>/dev/null
 if [ -f "$TTFF_PID_FILE" ]; then
-    echo "FAIL: TTFF_PID_FILE still exists after _ttff_poll_and_log exited (stale PID left behind)"
+    echo "FAIL: TTFF_PID_FILE still exists after the backgrounded poller exited (stale PID left behind)"
     exit 1
 else
     echo "PASS: TTFF_PID_FILE was cleared on exit"
@@ -788,8 +806,13 @@ _ttff_record_poller_pid() {
 # path of _ttff_poll_and_log so a finished poller never leaves a stale PID
 # behind - an uncleared stale PID risks the OS eventually reusing it for
 # an unrelated process, which _ttff_kill_previous_poller would then kill.
+# Compares against $BASHPID, not $$: this function always runs inside the
+# backgrounded subshell start_ttff_poller spawns, where $$ still reports
+# the invoking shell's PID rather than the job's own - $BASHPID (which is
+# what $! captures in the parent, and what TTFF_PID_FILE actually holds)
+# is the only one that matches here.
 _ttff_clear_own_pid() {
-    [ "$(cat "$TTFF_PID_FILE" 2>/dev/null)" = "$$" ] && rm -f "$TTFF_PID_FILE"
+    [ "$(cat "$TTFF_PID_FILE" 2>/dev/null)" = "$BASHPID" ] && rm -f "$TTFF_PID_FILE"
 }
 
 # Polls gpsd for a 3D fix and logs the result. $1=payload name literal,

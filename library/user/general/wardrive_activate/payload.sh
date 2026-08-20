@@ -207,8 +207,13 @@ _ttff_record_poller_pid() {
 # path of _ttff_poll_and_log so a finished poller never leaves a stale PID
 # behind - an uncleared stale PID risks the OS eventually reusing it for
 # an unrelated process, which _ttff_kill_previous_poller would then kill.
+# Compares against $BASHPID, not $$: this function always runs inside the
+# backgrounded subshell start_ttff_poller spawns, where $$ still reports
+# the invoking shell's PID rather than the job's own - $BASHPID (which is
+# what $! captures in the parent, and what TTFF_PID_FILE actually holds)
+# is the only one that matches here.
 _ttff_clear_own_pid() {
-    [ "$(cat "$TTFF_PID_FILE" 2>/dev/null)" = "$$" ] && rm -f "$TTFF_PID_FILE"
+    [ "$(cat "$TTFF_PID_FILE" 2>/dev/null)" = "$BASHPID" ] && rm -f "$TTFF_PID_FILE"
 }
 
 # Polls gpsd for a 3D fix and logs the result. $1=payload name literal,
