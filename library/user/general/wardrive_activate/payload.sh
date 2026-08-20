@@ -151,6 +151,79 @@ inject_hotstart() {
     return 1
 }
 
+# --- GPS TTFF logging ----------------------------------------------------
+# Passively records time-to-first-fix after a gpsd (re)start, so the
+# hot-start improvement can be observed across real wardriving sessions
+# instead of only manual A/B tests. See
+# docs/superpowers/specs/2026-08-19-gps-ttff-logging-design.md.
+TTFF_LOG_FILE="${TTFF_LOG_FILE:-/root/wardrive_ttff.log}"
+TTFF_PID_FILE="${TTFF_PID_FILE:-/tmp/ttff_poller.pid}"
+TTFF_POLL_INTERVAL="${TTFF_POLL_INTERVAL:-5}"
+TTFF_POLL_TIMEOUT="${TTFF_POLL_TIMEOUT:-600}"
+
+# Formats and appends one TTFF result line. $1=payload name literal,
+# $2=injected (yes|no), $3=result - either the elapsed seconds as a plain
+# integer, or the literal string "timeout".
+_ttff_write_result_line() {
+    local payload_name="$1" injected="$2" result="$3" ts ttff_field
+    ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    if [ "$result" = "timeout" ]; then
+        ttff_field="timeout(${TTFF_POLL_TIMEOUT}s)"
+    else
+        ttff_field="${result}s"
+    fi
+    echo "${ts} ${payload_name} injected=${injected} ttff=${ttff_field}" >> "$TTFF_LOG_FILE" 2>/dev/null
+}
+
+# Kills any still-alive poller recorded in TTFF_PID_FILE. Call BEFORE
+# spawning a new poller, so a stale poller is never left running
+# concurrently with a fresh one.
+_ttff_kill_previous_poller() {
+    local old_pid
+    if [ -f "$TTFF_PID_FILE" ]; then
+        old_pid="$(cat "$TTFF_PID_FILE" 2>/dev/null)"
+        case "$old_pid" in
+            ''|*[!0-9]*) ;;
+            *) kill -0 "$old_pid" 2>/dev/null && kill "$old_pid" 2>/dev/null ;;
+        esac
+    fi
+}
+
+# Records $1 (a poller's PID) in TTFF_PID_FILE. Call AFTER spawning the
+# poller, once its real PID ($!) is known.
+_ttff_record_poller_pid() {
+    echo "$1" > "$TTFF_PID_FILE" 2>/dev/null
+}
+
+# Polls gpsd for a 3D fix and logs the result. $1=payload name literal,
+# $2=injected (yes|no). Intended to run backgrounded via start_ttff_poller
+# - never call directly in the foreground, it can block for up to
+# TTFF_POLL_TIMEOUT seconds.
+_ttff_poll_and_log() {
+    local payload_name="$1" injected="$2" elapsed=0 line
+    while [ "$elapsed" -lt "$TTFF_POLL_TIMEOUT" ]; do
+        line=$(timeout 3 gpspipe -w -n 20 2>/dev/null | grep -m1 '"class":"TPV".*"mode":3')
+        if [ -n "$line" ]; then
+            _ttff_write_result_line "$payload_name" "$injected" "$elapsed"
+            return
+        fi
+        sleep "$TTFF_POLL_INTERVAL"
+        elapsed=$((elapsed + TTFF_POLL_INTERVAL))
+    done
+    _ttff_write_result_line "$payload_name" "$injected" "timeout"
+}
+
+# Spawns the background TTFF poller. $1=payload name literal (e.g.
+# "gps-checker"), $2=injected (yes|no). Call immediately after gpsd has
+# been (re)started - never blocks the caller. Kills any still-running
+# previous poller first, so pollers never overlap.
+start_ttff_poller() {
+    local payload_name="$1" injected="$2"
+    _ttff_kill_previous_poller
+    _ttff_poll_and_log "$payload_name" "$injected" &
+    _ttff_record_poller_pid "$!"
+}
+
 # =============================================================================
 # INTERNALS: helpers and device detection
 # =============================================================================
@@ -328,10 +401,12 @@ LOG "Restarting gpsd..."
 # is already a validated character device by this point (checked above).
 trap '/etc/init.d/gpsd start' EXIT INT TERM
 /etc/init.d/gpsd stop
-inject_hotstart "$selected_device"
+injected=no
+if inject_hotstart "$selected_device"; then injected=yes; fi
 sleep 0.5
 /etc/init.d/gpsd start
 trap - EXIT INT TERM
+start_ttff_poller "wardrive_activate" "$injected"
 
 # Enable Wigle logging now that GPS is configured (no uploads are performed).
 LOG "Enabling Wigle logging..."
