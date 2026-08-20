@@ -64,7 +64,14 @@ assert_eq() {
     fi
 }
 
-# Deterministic timestamp for exact-line-content assertions below.
+# Deterministic timestamp for exact-line-content assertions below. Only
+# the `-u +%Y-%m-%dT%H:%M:%SZ` form (used by _ttff_write_result_line's
+# timestamp) is faked; `date +%s` (used by _ttff_poll_and_log's
+# wall-clock elapsed accounting) intentionally falls through to the real
+# clock below, since that accounting needs genuine elapsed time to be
+# meaningfully tested - see the "elapsed reflects real wall-clock time"
+# case further down, which measures against real time rather than
+# asserting an exact faked value.
 date() {
     if [ "$1" = "-u" ] && [ "$2" = "+%Y-%m-%dT%H:%M:%SZ" ]; then
         echo "2026-08-19T04:23:32Z"
@@ -77,6 +84,7 @@ date() {
 # run_check/while-loop (added during the hot-start feature), so sourcing
 # it here only defines functions - no side effects, no fakes needed for
 # LOG/service/uci/etc.
+#
 source /Users/eighmy/repos/PineapplePager/payloads/library/user/general/gps-checker/payload.sh
 
 echo "== _ttff_write_result_line: success case =="
@@ -179,6 +187,102 @@ assert_eq "new poller logged a timeout line" \
     "2026-08-19T04:23:32Z gps-checker injected=no ttff=timeout(1s)" \
     "$(cat "$TTFF_LOG_FILE")"
 
+echo "== start_ttff_poller: does not hold the caller's stdout/stderr open =="
+TTFF_PID_FILE=/tmp/gps_ttff_tests/fdtest.pid
+TTFF_LOG_FILE=/tmp/gps_ttff_tests/fdtest.log
+TTFF_POLL_TIMEOUT=30
+TTFF_POLL_INTERVAL=5
+rm -f "$TTFF_PID_FILE" "$TTFF_LOG_FILE"
+gpspipe() { :; }  # never returns a fix - poller stays alive the full 30s if not fixed
+fifo=/tmp/gps_ttff_tests/fdtest.fifo
+readerdone=/tmp/gps_ttff_tests/fdtest.reader_done
+readerrc=/tmp/gps_ttff_tests/fdtest.reader_rc
+rm -f "$fifo" "$readerdone" "$readerrc"
+mkfifo "$fifo"
+# Open the read end in the background FIRST: opening a FIFO for write blocks
+# until a reader is present, so the reader must already be waiting before
+# start_ttff_poller's redirect opens the write end below.
+( timeout 5 cat "$fifo" >/dev/null; echo $? > "$readerrc"; touch "$readerdone" ) &
+reader_pid=$!
+sleep 0.3
+( start_ttff_poller "gps-checker" "no" >"$fifo" 2>&1 )
+# start_ttff_poller itself returns immediately either way (it backgrounds the poller).
+# The bug is that the backgrounded child keeps a dup of the fifo's write end open,
+# so the fifo never sees a final close and the reader never gets EOF. Poll (bounded)
+# for the reader to finish; if it doesn't finish promptly with rc=0 (clean EOF before
+# its own timeout), the poller is still holding the write end open.
+waited=0
+while [ ! -f "$readerdone" ] && [ "$waited" -lt 30 ]; do
+    sleep 0.1
+    waited=$((waited + 1))
+done
+if [ -f "$readerdone" ] && [ "$(cat "$readerrc" 2>/dev/null)" = "0" ]; then
+    echo "PASS: fifo reached EOF promptly, poller does not hold stdout/stderr open"
+else
+    echo "FAIL: reading from fifo timed out - poller is still holding stdout/stderr open"
+    kill "$(cat "$TTFF_PID_FILE" 2>/dev/null)" 2>/dev/null
+    kill "$reader_pid" 2>/dev/null
+    rm -f "$fifo" "$readerdone" "$readerrc"
+    exit 1
+fi
+kill "$(cat "$TTFF_PID_FILE" 2>/dev/null)" 2>/dev/null
+kill "$reader_pid" 2>/dev/null
+rm -f "$fifo" "$readerdone" "$readerrc"
+
+echo "== _ttff_poll_and_log: elapsed reflects real wall-clock time, not just sleep durations =="
+TTFF_LOG_FILE=/tmp/gps_ttff_tests/wallclock.log
+TTFF_PID_FILE=/tmp/gps_ttff_tests/wallclock.pid
+TTFF_POLL_TIMEOUT=30
+TTFF_POLL_INTERVAL=10
+rm -f "$TTFF_LOG_FILE" "$TTFF_PID_FILE"
+# Simulates gpspipe blocking for ~2 real seconds before returning a hit on
+# the very FIRST iteration - the loop's `sleep "$TTFF_POLL_INTERVAL"` never
+# runs, so a sleep-only elapsed accumulator would log ttff=0s even though
+# ~2 real seconds actually passed. This is exactly the undercounting bug
+# the wall-clock (`date +%s`) accounting fixes.
+gpspipe() { sleep 2; echo '{"class":"TPV","mode":3}'; }
+# The real `timeout` binary execve()s its target directly, so it can
+# never see gpspipe when gpspipe is a shell function (same limitation
+# documented for ubx_write_frame in payload.sh) - swap in a plain
+# passthrough here so this call actually reaches the stubbed gpspipe.
+# gpspipe's own `sleep 2` already bounds this to ~2s, so no hard timeout
+# of its own is needed.
+timeout() { shift; "$@"; }
+before="$(command date +%s)"
+_ttff_poll_and_log "gps-checker" "no"
+after="$(command date +%s)"
+unset -f timeout
+real_elapsed=$((after - before))
+logged_ttff="$(grep -o 'ttff=[0-9]*s' "$TTFF_LOG_FILE" 2>/dev/null | grep -o '[0-9]*')"
+if [ -z "$logged_ttff" ]; then
+    echo "FAIL: no numeric ttff value logged (got: $(cat "$TTFF_LOG_FILE" 2>/dev/null))"
+    exit 1
+elif [ "$logged_ttff" -lt 1 ]; then
+    echo "FAIL: logged ttff=${logged_ttff}s undercounts - gpspipe alone took ~2 real seconds"
+    exit 1
+elif [ $(( real_elapsed - logged_ttff )) -gt 2 ] 2>/dev/null || [ $(( real_elapsed - logged_ttff )) -lt -2 ] 2>/dev/null; then
+    echo "FAIL: logged ttff=${logged_ttff}s is not close to the real measured ${real_elapsed}s"
+    exit 1
+else
+    echo "PASS: logged ttff=${logged_ttff}s reflects real wall-clock time (measured ${real_elapsed}s)"
+fi
+
+echo "== _ttff_poll_and_log: clears TTFF_PID_FILE on exit if it still names this process =="
+TTFF_LOG_FILE=/tmp/gps_ttff_tests/pidclear.log
+TTFF_PID_FILE=/tmp/gps_ttff_tests/pidclear.pid
+TTFF_POLL_TIMEOUT=1
+TTFF_POLL_INTERVAL=1
+rm -f "$TTFF_LOG_FILE" "$TTFF_PID_FILE"
+gpspipe() { :; }  # no fix ever arrives - forces the timeout path
+echo "$$" > "$TTFF_PID_FILE"   # simulate this process having recorded its own pid
+_ttff_poll_and_log "gps-checker" "no"
+if [ -f "$TTFF_PID_FILE" ]; then
+    echo "FAIL: TTFF_PID_FILE still exists after _ttff_poll_and_log exited (stale PID left behind)"
+    exit 1
+else
+    echo "PASS: TTFF_PID_FILE was cleared on exit"
+fi
+
 echo "ALL TESTS PASSED"
 ```
 
@@ -204,7 +308,11 @@ TTFF_POLL_TIMEOUT="${TTFF_POLL_TIMEOUT:-600}"
 
 # Formats and appends one TTFF result line. $1=payload name literal,
 # $2=injected (yes|no), $3=result - either the elapsed seconds as a plain
-# integer, or the literal string "timeout".
+# integer, or the literal string "timeout". Grouped so 2>/dev/null covers
+# a failed *open* of TTFF_LOG_FILE too, not just a post-open write error -
+# redirects apply left-to-right, so `cmd >>file 2>/dev/null` alone would
+# leak an open failure to the original stderr before the suppression took
+# effect.
 _ttff_write_result_line() {
     local payload_name="$1" injected="$2" result="$3" ts ttff_field
     ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -213,7 +321,7 @@ _ttff_write_result_line() {
     else
         ttff_field="${result}s"
     fi
-    echo "${ts} ${payload_name} injected=${injected} ttff=${ttff_field}" >> "$TTFF_LOG_FILE" 2>/dev/null
+    { echo "${ts} ${payload_name} injected=${injected} ttff=${ttff_field}" >> "$TTFF_LOG_FILE"; } 2>/dev/null
 }
 
 # Kills any still-alive poller recorded in TTFF_PID_FILE. Call BEFORE
@@ -231,37 +339,64 @@ _ttff_kill_previous_poller() {
 }
 
 # Records $1 (a poller's PID) in TTFF_PID_FILE. Call AFTER spawning the
-# poller, once its real PID ($!) is known.
+# poller, once its real PID ($!) is known. Grouped so 2>/dev/null covers a
+# failed *open* of TTFF_PID_FILE too - unlike _ttff_write_result_line,
+# this runs in the caller's foreground context, so an unsuppressed open
+# failure would leak a raw shell error into the payload's interactive
+# output instead of failing silently.
 _ttff_record_poller_pid() {
-    echo "$1" > "$TTFF_PID_FILE" 2>/dev/null
+    { echo "$1" > "$TTFF_PID_FILE"; } 2>/dev/null
+}
+
+# Clears TTFF_PID_FILE if it still names this process. Call on every exit
+# path of _ttff_poll_and_log so a finished poller never leaves a stale PID
+# behind - an uncleared stale PID risks the OS eventually reusing it for
+# an unrelated process, which _ttff_kill_previous_poller would then kill.
+_ttff_clear_own_pid() {
+    [ "$(cat "$TTFF_PID_FILE" 2>/dev/null)" = "$$" ] && rm -f "$TTFF_PID_FILE"
 }
 
 # Polls gpsd for a 3D fix and logs the result. $1=payload name literal,
 # $2=injected (yes|no). Intended to run backgrounded via start_ttff_poller
 # - never call directly in the foreground, it can block for up to
-# TTFF_POLL_TIMEOUT seconds.
+# TTFF_POLL_TIMEOUT seconds. Elapsed time is real wall-clock time (via
+# `date +%s`), not a sum of sleep durations - each iteration's
+# `timeout 3 gpspipe ...` can itself take up to 3 real seconds, and that
+# time must count too or the logged ttff value (and the loop's own
+# TTFF_POLL_TIMEOUT cap) would systematically undercount real elapsed
+# time, defeating the point of comparing these numbers against wall-clock
+# hardware baselines.
 _ttff_poll_and_log() {
-    local payload_name="$1" injected="$2" elapsed=0 line
+    local payload_name="$1" injected="$2" start elapsed line
+    start="$(date +%s)"
+    elapsed=0
     while [ "$elapsed" -lt "$TTFF_POLL_TIMEOUT" ]; do
         line=$(timeout 3 gpspipe -w -n 20 2>/dev/null | grep -m1 '"class":"TPV".*"mode":3')
         if [ -n "$line" ]; then
+            elapsed=$(( $(date +%s) - start ))
             _ttff_write_result_line "$payload_name" "$injected" "$elapsed"
+            _ttff_clear_own_pid
             return
         fi
         sleep "$TTFF_POLL_INTERVAL"
-        elapsed=$((elapsed + TTFF_POLL_INTERVAL))
+        elapsed=$(( $(date +%s) - start ))
     done
     _ttff_write_result_line "$payload_name" "$injected" "timeout"
+    _ttff_clear_own_pid
 }
 
 # Spawns the background TTFF poller. $1=payload name literal (e.g.
 # "gps-checker"), $2=injected (yes|no). Call immediately after gpsd has
 # been (re)started - never blocks the caller. Kills any still-running
-# previous poller first, so pollers never overlap.
+# previous poller first, so pollers never overlap. Redirects the poller's
+# stdio away from the caller's - without this, a non-interactive caller
+# (e.g. a plain SSH command) whose stdout/stderr the poller inherited
+# would hang waiting for those streams to close, even though the caller
+# itself returns immediately.
 start_ttff_poller() {
     local payload_name="$1" injected="$2"
     _ttff_kill_previous_poller
-    _ttff_poll_and_log "$payload_name" "$injected" &
+    _ttff_poll_and_log "$payload_name" "$injected" </dev/null >/dev/null 2>&1 &
     _ttff_record_poller_pid "$!"
 }
 
@@ -374,6 +509,13 @@ assert_eq() {
     fi
 }
 
+# Only the `-u +%Y-%m-%dT%H:%M:%SZ` form (used by _ttff_write_result_line's
+# timestamp) is faked; `date +%s` (used by _ttff_poll_and_log's
+# wall-clock elapsed accounting) intentionally falls through to the real
+# clock below, since that accounting needs genuine elapsed time to be
+# meaningfully tested - see the "elapsed reflects real wall-clock time"
+# case further down, which measures against real time rather than
+# asserting an exact faked value.
 date() {
     if [ "$1" = "-u" ] && [ "$2" = "+%Y-%m-%dT%H:%M:%SZ" ]; then
         echo "2026-08-19T04:23:32Z"
@@ -481,6 +623,102 @@ assert_eq "new poller logged a timeout line" \
     "2026-08-19T04:23:32Z wardrive_activate injected=no ttff=timeout(1s)" \
     "$(cat "$TTFF_LOG_FILE")"
 
+echo "== start_ttff_poller: does not hold the caller's stdout/stderr open =="
+TTFF_PID_FILE=/tmp/gps_ttff_tests/wa_fdtest.pid
+TTFF_LOG_FILE=/tmp/gps_ttff_tests/wa_fdtest.log
+TTFF_POLL_TIMEOUT=30
+TTFF_POLL_INTERVAL=5
+rm -f "$TTFF_PID_FILE" "$TTFF_LOG_FILE"
+gpspipe() { :; }  # never returns a fix - poller stays alive the full 30s if not fixed
+fifo=/tmp/gps_ttff_tests/wa_fdtest.fifo
+readerdone=/tmp/gps_ttff_tests/wa_fdtest.reader_done
+readerrc=/tmp/gps_ttff_tests/wa_fdtest.reader_rc
+rm -f "$fifo" "$readerdone" "$readerrc"
+mkfifo "$fifo"
+# Open the read end in the background FIRST: opening a FIFO for write blocks
+# until a reader is present, so the reader must already be waiting before
+# start_ttff_poller's redirect opens the write end below.
+( timeout 5 cat "$fifo" >/dev/null; echo $? > "$readerrc"; touch "$readerdone" ) &
+reader_pid=$!
+sleep 0.3
+( start_ttff_poller "wardrive_activate" "no" >"$fifo" 2>&1 )
+# start_ttff_poller itself returns immediately either way (it backgrounds the poller).
+# The bug is that the backgrounded child keeps a dup of the fifo's write end open,
+# so the fifo never sees a final close and the reader never gets EOF. Poll (bounded)
+# for the reader to finish; if it doesn't finish promptly with rc=0 (clean EOF before
+# its own timeout), the poller is still holding the write end open.
+waited=0
+while [ ! -f "$readerdone" ] && [ "$waited" -lt 30 ]; do
+    sleep 0.1
+    waited=$((waited + 1))
+done
+if [ -f "$readerdone" ] && [ "$(cat "$readerrc" 2>/dev/null)" = "0" ]; then
+    echo "PASS: fifo reached EOF promptly, poller does not hold stdout/stderr open"
+else
+    echo "FAIL: reading from fifo timed out - poller is still holding stdout/stderr open"
+    kill "$(cat "$TTFF_PID_FILE" 2>/dev/null)" 2>/dev/null
+    kill "$reader_pid" 2>/dev/null
+    rm -f "$fifo" "$readerdone" "$readerrc"
+    exit 1
+fi
+kill "$(cat "$TTFF_PID_FILE" 2>/dev/null)" 2>/dev/null
+kill "$reader_pid" 2>/dev/null
+rm -f "$fifo" "$readerdone" "$readerrc"
+
+echo "== _ttff_poll_and_log: elapsed reflects real wall-clock time, not just sleep durations =="
+TTFF_LOG_FILE=/tmp/gps_ttff_tests/wa_wallclock.log
+TTFF_PID_FILE=/tmp/gps_ttff_tests/wa_wallclock.pid
+TTFF_POLL_TIMEOUT=30
+TTFF_POLL_INTERVAL=10
+rm -f "$TTFF_LOG_FILE" "$TTFF_PID_FILE"
+# Simulates gpspipe blocking for ~2 real seconds before returning a hit on
+# the very FIRST iteration - the loop's `sleep "$TTFF_POLL_INTERVAL"` never
+# runs, so a sleep-only elapsed accumulator would log ttff=0s even though
+# ~2 real seconds actually passed. This is exactly the undercounting bug
+# the wall-clock (`date +%s`) accounting fixes.
+gpspipe() { sleep 2; echo '{"class":"TPV","mode":3}'; }
+# The real `timeout` binary execve()s its target directly, so it can
+# never see gpspipe when gpspipe is a shell function (same limitation
+# documented for ubx_write_frame in payload.sh) - swap in a plain
+# passthrough here so this call actually reaches the stubbed gpspipe.
+# gpspipe's own `sleep 2` already bounds this to ~2s, so no hard timeout
+# of its own is needed.
+timeout() { shift; "$@"; }
+before="$(command date +%s)"
+_ttff_poll_and_log "wardrive_activate" "no"
+after="$(command date +%s)"
+unset -f timeout
+real_elapsed=$((after - before))
+logged_ttff="$(grep -o 'ttff=[0-9]*s' "$TTFF_LOG_FILE" 2>/dev/null | grep -o '[0-9]*')"
+if [ -z "$logged_ttff" ]; then
+    echo "FAIL: no numeric ttff value logged (got: $(cat "$TTFF_LOG_FILE" 2>/dev/null))"
+    exit 1
+elif [ "$logged_ttff" -lt 1 ]; then
+    echo "FAIL: logged ttff=${logged_ttff}s undercounts - gpspipe alone took ~2 real seconds"
+    exit 1
+elif [ $(( real_elapsed - logged_ttff )) -gt 2 ] 2>/dev/null || [ $(( real_elapsed - logged_ttff )) -lt -2 ] 2>/dev/null; then
+    echo "FAIL: logged ttff=${logged_ttff}s is not close to the real measured ${real_elapsed}s"
+    exit 1
+else
+    echo "PASS: logged ttff=${logged_ttff}s reflects real wall-clock time (measured ${real_elapsed}s)"
+fi
+
+echo "== _ttff_poll_and_log: clears TTFF_PID_FILE on exit if it still names this process =="
+TTFF_LOG_FILE=/tmp/gps_ttff_tests/wa_pidclear.log
+TTFF_PID_FILE=/tmp/gps_ttff_tests/wa_pidclear.pid
+TTFF_POLL_TIMEOUT=1
+TTFF_POLL_INTERVAL=1
+rm -f "$TTFF_LOG_FILE" "$TTFF_PID_FILE"
+gpspipe() { :; }  # no fix ever arrives - forces the timeout path
+echo "$$" > "$TTFF_PID_FILE"   # simulate this process having recorded its own pid
+_ttff_poll_and_log "wardrive_activate" "no"
+if [ -f "$TTFF_PID_FILE" ]; then
+    echo "FAIL: TTFF_PID_FILE still exists after _ttff_poll_and_log exited (stale PID left behind)"
+    exit 1
+else
+    echo "PASS: TTFF_PID_FILE was cleared on exit"
+fi
+
 echo "ALL TESTS PASSED"
 ```
 
@@ -506,7 +744,11 @@ TTFF_POLL_TIMEOUT="${TTFF_POLL_TIMEOUT:-600}"
 
 # Formats and appends one TTFF result line. $1=payload name literal,
 # $2=injected (yes|no), $3=result - either the elapsed seconds as a plain
-# integer, or the literal string "timeout".
+# integer, or the literal string "timeout". Grouped so 2>/dev/null covers
+# a failed *open* of TTFF_LOG_FILE too, not just a post-open write error -
+# redirects apply left-to-right, so `cmd >>file 2>/dev/null` alone would
+# leak an open failure to the original stderr before the suppression took
+# effect.
 _ttff_write_result_line() {
     local payload_name="$1" injected="$2" result="$3" ts ttff_field
     ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -515,7 +757,7 @@ _ttff_write_result_line() {
     else
         ttff_field="${result}s"
     fi
-    echo "${ts} ${payload_name} injected=${injected} ttff=${ttff_field}" >> "$TTFF_LOG_FILE" 2>/dev/null
+    { echo "${ts} ${payload_name} injected=${injected} ttff=${ttff_field}" >> "$TTFF_LOG_FILE"; } 2>/dev/null
 }
 
 # Kills any still-alive poller recorded in TTFF_PID_FILE. Call BEFORE
@@ -533,37 +775,64 @@ _ttff_kill_previous_poller() {
 }
 
 # Records $1 (a poller's PID) in TTFF_PID_FILE. Call AFTER spawning the
-# poller, once its real PID ($!) is known.
+# poller, once its real PID ($!) is known. Grouped so 2>/dev/null covers a
+# failed *open* of TTFF_PID_FILE too - unlike _ttff_write_result_line,
+# this runs in the caller's foreground context, so an unsuppressed open
+# failure would leak a raw shell error into the payload's interactive
+# output instead of failing silently.
 _ttff_record_poller_pid() {
-    echo "$1" > "$TTFF_PID_FILE" 2>/dev/null
+    { echo "$1" > "$TTFF_PID_FILE"; } 2>/dev/null
+}
+
+# Clears TTFF_PID_FILE if it still names this process. Call on every exit
+# path of _ttff_poll_and_log so a finished poller never leaves a stale PID
+# behind - an uncleared stale PID risks the OS eventually reusing it for
+# an unrelated process, which _ttff_kill_previous_poller would then kill.
+_ttff_clear_own_pid() {
+    [ "$(cat "$TTFF_PID_FILE" 2>/dev/null)" = "$$" ] && rm -f "$TTFF_PID_FILE"
 }
 
 # Polls gpsd for a 3D fix and logs the result. $1=payload name literal,
 # $2=injected (yes|no). Intended to run backgrounded via start_ttff_poller
 # - never call directly in the foreground, it can block for up to
-# TTFF_POLL_TIMEOUT seconds.
+# TTFF_POLL_TIMEOUT seconds. Elapsed time is real wall-clock time (via
+# `date +%s`), not a sum of sleep durations - each iteration's
+# `timeout 3 gpspipe ...` can itself take up to 3 real seconds, and that
+# time must count too or the logged ttff value (and the loop's own
+# TTFF_POLL_TIMEOUT cap) would systematically undercount real elapsed
+# time, defeating the point of comparing these numbers against wall-clock
+# hardware baselines.
 _ttff_poll_and_log() {
-    local payload_name="$1" injected="$2" elapsed=0 line
+    local payload_name="$1" injected="$2" start elapsed line
+    start="$(date +%s)"
+    elapsed=0
     while [ "$elapsed" -lt "$TTFF_POLL_TIMEOUT" ]; do
         line=$(timeout 3 gpspipe -w -n 20 2>/dev/null | grep -m1 '"class":"TPV".*"mode":3')
         if [ -n "$line" ]; then
+            elapsed=$(( $(date +%s) - start ))
             _ttff_write_result_line "$payload_name" "$injected" "$elapsed"
+            _ttff_clear_own_pid
             return
         fi
         sleep "$TTFF_POLL_INTERVAL"
-        elapsed=$((elapsed + TTFF_POLL_INTERVAL))
+        elapsed=$(( $(date +%s) - start ))
     done
     _ttff_write_result_line "$payload_name" "$injected" "timeout"
+    _ttff_clear_own_pid
 }
 
 # Spawns the background TTFF poller. $1=payload name literal (e.g.
 # "gps-checker"), $2=injected (yes|no). Call immediately after gpsd has
 # been (re)started - never blocks the caller. Kills any still-running
-# previous poller first, so pollers never overlap.
+# previous poller first, so pollers never overlap. Redirects the poller's
+# stdio away from the caller's - without this, a non-interactive caller
+# (e.g. a plain SSH command) whose stdout/stderr the poller inherited
+# would hang waiting for those streams to close, even though the caller
+# itself returns immediately.
 start_ttff_poller() {
     local payload_name="$1" injected="$2"
     _ttff_kill_previous_poller
-    _ttff_poll_and_log "$payload_name" "$injected" &
+    _ttff_poll_and_log "$payload_name" "$injected" </dev/null >/dev/null 2>&1 &
     _ttff_record_poller_pid "$!"
 }
 
@@ -705,8 +974,8 @@ sed -n "1,/^LOG \"Detecting GPS devices/p" /root/payloads/user/general/wardrive_
 PAYLOAD_GET_CONFIG() { uci -q get "payload.$1.$2" 2>/dev/null; }
 LOG() { :; }
 source /tmp/_wa_funcs.sh
-device="$(readlink -f /dev/serial/by-path/*)"
-device="$(echo "$device" | head -n1)"
+device="$(ls -1 /dev/serial/by-path/* 2>/dev/null | head -n1)"
+device="$(readlink -f "$device" 2>/dev/null)"
 LOG "Restarting gpsd..."
 trap "/etc/init.d/gpsd start" EXIT INT TERM
 /etc/init.d/gpsd stop
