@@ -220,7 +220,7 @@ _ttff_poll_and_log() {
 start_ttff_poller() {
     local payload_name="$1" injected="$2"
     _ttff_kill_previous_poller
-    _ttff_poll_and_log "$payload_name" "$injected" &
+    _ttff_poll_and_log "$payload_name" "$injected" </dev/null >/dev/null 2>&1 &
     _ttff_record_poller_pid "$!"
 }
 

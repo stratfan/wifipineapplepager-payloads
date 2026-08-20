@@ -17,13 +17,15 @@ Both `gps-checker` and `wardrive_activate` already have a point where gpsd is (r
 - `wardrive_activate`: right after its `/etc/init.d/gpsd start` call (payload.sh, currently line 333), following the `inject_hotstart` call at line 331.
 - `gps-checker`: inside `restart_gpsd()`, right after `service gpsd start`.
 
-At that point, each spawns a detached background subshell (plain `... &`, no `nohup`/`disown` needed — confirmed sufficient for a non-interactively-run payload.sh during hardware testing) that:
+At that point, each spawns a detached background subshell (`_ttff_poll_and_log ... </dev/null >/dev/null 2>&1 &`) that:
 
 1. Records the poll start.
 2. Polls `gpspipe -w` for a `TPV` report with `mode:3`, every 5s, up to a 600s cap. This reuses the exact fix-detection pattern (`gpspipe -w` + mode-3 check) already validated live against real hardware.
 3. Appends one line to `/root/wardrive_ttff.log` on success (elapsed seconds) or on hitting the 600s cap (timeout marker).
 
 The payload script itself never blocks on this — `wardrive_activate` proceeds immediately to `WIGLE_START` and its confirmation dialog; `gps-checker`'s on-screen retry loop is likewise unaffected.
+
+An earlier version of this doc claimed plain `... &` (no `nohup`/`disown`) was sufficient for a non-interactively-run payload.sh, based on manual hardware testing. That claim was disproven by later hardware verification: without redirecting stdin/stdout/stderr, the backgrounded poller inherits the caller's file descriptors, so anything waiting for those *streams* to close (not just the calling process to exit) — confirmed via a plain non-pty `ssh host 'restart_gpsd'` — hung for up to `TTFF_POLL_TIMEOUT` (default 600s), even though the real work finished in about a second. The poller writes its results to `$TTFF_LOG_FILE` via an explicit `>>` redirect and never needs the inherited descriptors, so `_ttff_poll_and_log ... </dev/null >/dev/null 2>&1 &` closes them off with no functional effect on the poller itself.
 
 Since this repo has no shared library and duplicates hot-start logic per payload already (see `gps-hotstart-design.md`), the poller function is duplicated into both files following that same convention — not factored into a new shared file.
 
