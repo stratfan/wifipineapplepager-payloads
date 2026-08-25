@@ -4,9 +4,21 @@ A WiFi Pineapple Pager payload for passively detecting Flock Safety surveillance
 
 ## What It Does
 
-Flock You continuously scans for BLE advertisements from Flock Safety infrastructure — ALPR cameras, Penguin backup batteries, and Pigvision devices. When a device is detected, it logs the MAC address, device name, and **GPS coordinates**, vibrates the Pager, flashes an LED, and displays a color-coded entry on screen.
+Flock You continuously scans for BLE advertisements from Flock Safety infrastructure — ALPR cameras, Penguin backup batteries, and Pigvision devices. When a device is detected, it logs the MAC address, the signal(s) that matched, a label, and **GPS coordinates**, vibrates the Pager, flashes an LED, and displays a color-coded entry on screen.
 
 The scanner runs continuously until you press the Pager's cancel button. All detections are saved to a timestamped log file in `/root/loot/flock_you/`.
+
+### Detection: three signals (v9.17+)
+
+Earlier versions matched only the BLE **device name**. Most real Flock adverts carry *no name* (they broadcast a MAC + manufacturer data), so name-only detection missed them. v9.17 checks three signals and alerts if **any** fire:
+
+| Signal | What it matches | How | Color |
+|--------|-----------------|-----|-------|
+| **MANUF** | XUNTONG manufacturer ID `0x09C8` in the BLE advertising data — the strongest Flock tell | `hcidump --raw`, byte signature `FF C8 09` | Magenta |
+| **OUI** | MAC prefix in `oui_list.txt` (Lite-On chipset + verified Flock/Falcon/Battery prefixes) | `hcidump --raw` MAC + prefix lookup | Yellow |
+| **NAME** | BLE name substring: `FS Ext Battery`, `Penguin`, `Pigvision`, `Flock` | `hcitool lescan` (v9.16 behavior) | Cyan |
+
+Each cycle runs `hcidump --raw` and `hcitool lescan` in parallel, then merges hits by MAC (combining tags when more than one signal fires). Note: OUI matching only works on devices advertising a fixed public MAC — randomized BLE addresses won't match an OUI, but the manufacturer-ID signal still catches them.
 
 ### GPS Tagging (v9.16+)
 
@@ -19,19 +31,10 @@ Two files are written per run in `/root/loot/flock_you/`:
 
 | File | Format |
 |------|--------|
-| `flock_hcitool_<timestamp>.txt` | Human-readable log: `DECT: HH:MM:SS \| MAC \| NAME \| lat,lon` |
-| `flock_gps_<timestamp>.csv` | `time,mac,name,lat,lon` — ready for mapping / import |
+| `flock_hcitool_<timestamp>.txt` | Human-readable log: `DECT: HH:MM:SS \| MAC \| SIGNALS \| label \| lat,lon` |
+| `flock_gps_<timestamp>.csv` | `time,mac,name_or_label,signals,lat,lon` — ready for mapping / import |
 
 For a GPS-tagged drive, start `wardrive_activate` (or `gps-checker`) first so `gpsd` is configured and has a fix before you run Flock You.
-
-### Detection Targets
-
-| Device | BLE Name Pattern | Log Color |
-|--------|-----------------|-----------|
-| Flock FS Ext Battery | `FS Ext Battery` | Yellow |
-| Flock Penguin | `Penguin-*` | Green |
-| Pigvision | `Pigvision` | Magenta |
-| Other Flock devices | `*flock*` | Cyan |
 
 ## Installation
 
@@ -45,11 +48,11 @@ The directory should contain:
 ```
 flock_you/
   payload.sh        # The scanner payload
-  oui_list.txt      # OUI fingerprint database (for future WiFi expansion)
+  oui_list.txt      # OUI fingerprint database (used for OUI-signal matching)
   README.md         # This file
 ```
 
-No additional packages are required. The Pager's built-in `hcitool` handles BLE scanning.
+No additional packages are required. The Pager's built-in `hcitool` and `hcidump` handle BLE scanning.
 
 > **Keep this a flat folder.** The Pager's payload scanner treats any directory
 > containing a subdirectory as a *category* rather than a payload, which hides it
