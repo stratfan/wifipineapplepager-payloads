@@ -8,6 +8,15 @@ Flock You continuously scans for BLE advertisements from Flock Safety infrastruc
 
 The scanner runs continuously until you press the Pager's cancel button. All detections are saved to a timestamped log file in `/root/loot/flock_you/`.
 
+### Wardrive mode + diagnostic log (v9.18+)
+
+BLE range is short (~10–30 m). Driving past a pole camera you're in range for only a few seconds, so v9.18 is tuned for drive-bys:
+
+- **Near-continuous scanning.** The adapter is brought up **once** at startup (not reset every cycle) and there is **no inter-cycle sleep**, raising the scan duty cycle from ~67% to ~90%. Scan windows are a short 8 s so a brief fly-by is more likely to land inside an active scan. If the adapter captures nothing for two cycles it self-resets.
+- **All-advert diagnostic log.** Every advert seen — not just Flock matches — is recorded to `flock_alladv_<ts>.csv` as `time,mac,manuf_id,rssi,name`. Drive past a *known* camera and this log shows exactly what it broadcasts (manufacturer ID + signal strength). It's the definitive way to tell a detection gap from a camera that simply emits no usable BLE. Detections also now carry `RSSI` (signal strength → proximity).
+
+> **BLE vs WiFi for cameras.** A Falcon *camera* is primarily a WiFi device; the confirmed BLE emitters are the Penguin battery and Pigvision. For mapping cameras while driving, the WiFi path (`wardrive_activate` → WiGLE, then `loot/flock_hits.sh` OUI matching) is more reliable. Run both.
+
 ### Detection: three signals (v9.17+)
 
 Earlier versions matched only the BLE **device name**. Most real Flock adverts carry *no name* (they broadcast a MAC + manufacturer data), so name-only detection missed them. v9.17 checks three signals and alerts if **any** fire:
@@ -31,8 +40,9 @@ Two files are written per run in `/root/loot/flock_you/`:
 
 | File | Format |
 |------|--------|
-| `flock_hcitool_<timestamp>.txt` | Human-readable log: `DECT: HH:MM:SS \| MAC \| SIGNALS \| label \| lat,lon` |
-| `flock_gps_<timestamp>.csv` | `time,mac,name_or_label,signals,lat,lon` — ready for mapping / import |
+| `flock_hcitool_<timestamp>.txt` | Human-readable log: `DECT: HH:MM:SS \| MAC \| SIGNALS \| label \| RSSI:xx \| lat,lon` |
+| `flock_gps_<timestamp>.csv` | `time,mac,name_or_label,signals,rssi,lat,lon` — Flock hits, ready for mapping |
+| `flock_alladv_<timestamp>.csv` | `time,mac,manuf_id,rssi,name` — **every** advert seen (diagnostic, v9.18+) |
 
 For a GPS-tagged drive, start `wardrive_activate` (or `gps-checker`) first so `gpsd` is configured and has a fix before you run Flock You.
 
