@@ -1,28 +1,39 @@
 #!/bin/bash
-# Title: Flock You - Wardrive Mode v9.18
+# Title: Flock You - Wardrive Mode v9.19
 # Description: Continuous BLE scanner for Flock Safety surveillance devices,
 #              tuned for driving past cameras.
-#              Detection (unchanged from v9.17) fires on THREE signals:
+#              Detection fires on THREE signals:
 #                MANUF  XUNTONG manufacturer ID 0x09C8 in the advertising data
 #                OUI    MAC prefix in oui_list.txt (Lite-On + verified Flock)
 #                NAME   BLE name substring (FS Ext Battery/Penguin/Pigvision/Flock)
-#              v9.18 changes for drive-bys:
-#                - Near-continuous scanning: the adapter is reset ONCE at start
-#                  (not every cycle) and there is NO inter-cycle sleep, so the
-#                  scan duty cycle goes from ~67% to ~90%. A short 8s window
-#                  keeps detection latency low so a brief fly-by is more likely
-#                  to land inside an active scan.
-#                - Diagnostic all-advert log: EVERY advert seen (not just Flock
-#                  matches) is recorded with its manufacturer ID and RSSI to
-#                  flock_alladv_<ts>.csv. Drive past a known camera and this log
-#                  shows exactly what it broadcasts - the definitive way to tell
-#                  a detection gap from a camera that emits no usable BLE.
+#              Field-proven: OUI is the signal that actually catches Falcon
+#              cameras (a 1477-device drive saw zero 0x09C8), so all three
+#              signals matter.
+#
+#              v9.19 fixes three field-observed defects in v9.18:
+#                1. "Set scan parameters failed: I/O error" flooding the log.
+#                   Killing `lescan` leaves LE scanning enabled in the
+#                   controller, so the next cycle could not set scan params.
+#                   Now scanning is explicitly disabled between cycles with
+#                   HCI LE Set Scan Enable=0 - fast, no adapter bounce, so the
+#                   high duty cycle is kept.
+#                2. Alerts lagging ~30 minutes behind the sighting. The
+#                   per-device dedup ran a grep against a growing seen-file
+#                   (O(n^2)): measured 79s PER CYCLE at 1477 devices, and
+#                   worsening. Bulk diagnostic dedup is now a single awk pass
+#                   (measured 0ms at the same volume).
+#                3. Detection timestamps were computed once per cycle, so a
+#                   logged time could be many minutes stale. The timestamp is
+#                   now taken at the moment of detection.
+#               Flock hits are also processed BEFORE the bulk diagnostic write,
+#               so the buzz/LED fire immediately rather than behind 1400+ rows.
+#
 #              Each detection is GPS-tagged from gpsd (NO_GPS when no fix).
 # Author: colonelpanichacks
 # Contributors: Claude (Anthropic), Grok (xAI), Brandon Starkweather
 # Data Sources: colonelpanichacks/flock-you, deflock.me, GainSec,
 #               Ryan O'Horo (FCC research), Will Greenberg (BLE research)
-# Version: 9.18
+# Version: 9.19
 # Category: Reconnaissance
 
 # --- paths --------------------------------------------------------------
@@ -37,14 +48,29 @@ LOG_FILE="${LOOT_DIR}/flock_hcitool_${TIMESTAMP}.txt"
 CSV_FILE="${LOOT_DIR}/flock_gps_${TIMESTAMP}.csv"
 ALLADV_FILE="${LOOT_DIR}/flock_alladv_${TIMESTAMP}.csv"
 
-RAW_FILE="/tmp/flock_raw.txt"
-SCAN_FILE="/tmp/flock_scan.txt"
-ADV_FILE="/tmp/flock_adv.txt"
-SEEN_FILE="/tmp/flock_seen.txt"       # detected (Flock) MACs
-ALLSEEN_FILE="/tmp/flock_allseen.txt" # every MAC (diagnostic dedup)
-: > "$SEEN_FILE"; : > "$ALLSEEN_FILE"
+# Per-instance temp files. The Pager UI launches payloads from a COPY at
+# /tmp/payload-<id>.sh, so a payload left running from an earlier session is
+# easy to miss; if a second instance starts, shared /tmp paths let the two
+# corrupt each other's capture and dedup state. $$ keeps every run isolated.
+TMPTAG="$$"
+RAW_FILE="/tmp/flock_raw_${TMPTAG}.txt"
+SCAN_FILE="/tmp/flock_scan_${TMPTAG}.txt"
+ADV_FILE="/tmp/flock_adv_${TMPTAG}.txt"
+HIT_FILE="/tmp/flock_hit_${TMPTAG}.txt"
+SEEN_FILE="/tmp/flock_seen_${TMPTAG}.txt"       # detected (Flock) MACs - small
+ALLSEEN_FILE="/tmp/flock_allseen_${TMPTAG}.txt" # every MAC (diagnostic) - large
+NEWSEEN_FILE="/tmp/flock_newseen_${TMPTAG}.txt" # new MACs (awk cannot append to a file it read)
+# No EXIT/TERM trap here, deliberately. Two ways it backfires on this
+# platform: background subshells (the `hcidump ... &` jobs) inherit an EXIT
+# trap and would delete the live dedup state every cycle, and a TERM trap
+# makes the payload SURVIVE being killed (bash resumes the loop after a
+# trapped signal), leaving immortal instances fighting over the adapter.
+# Per-instance filenames already prevent collisions; /tmp is tmpfs and clears
+# on reboot. Just remove our own leftovers at startup.
+rm -f /tmp/flock_*_"${TMPTAG}".txt
+: > "$SEEN_FILE"; : > "$ALLSEEN_FILE"; : > "$NEWSEEN_FILE"
 
-# --- GPS fix reader (unchanged) -----------------------------------------
+# --- GPS fix reader -----------------------------------------------------
 get_gps_fix() {
     local json mode lat lon
     json="$(timeout 3 gpspipe -w -n 30 2>/dev/null | grep '"class":"TPV"' | grep '"lat":' | tail -n 1)"
@@ -57,12 +83,13 @@ get_gps_fix() {
     echo "${lat},${lon}"
 }
 
+# Clears LE scan state left behind when `hcitool lescan` is killed.
+# Without this the next cycle fails with "Set scan parameters failed: I/O error".
+stop_le_scan() { hcitool cmd 0x08 0x000C 00 00 >/dev/null 2>&1; }
+
 # --- unified advert parser ----------------------------------------------
-# Reads RAW (hcidump --raw) + SCAN (hcitool lescan), emits ONE line per
-# unique MAC seen this cycle:  MAC|MANUF|RSSI|TAGS|LABEL|NAME
-#   MANUF = 0xNNNN company id (or -), RSSI = best (max) dBm this cycle,
-#   TAGS  = flock signals (MANUF:XUNTONG / OUI:<cat> / NAME) or empty,
-#   LABEL = oui_list label if OUI matched, NAME = BLE name if advertised.
+# Emits one line per unique MAC this cycle:
+#   MAC|MANUF|RSSI|TAGS|LABEL|NAME
 parse_adverts() {
     awk -v ouifile="$OUI_LIST" -v scanfile="$SCAN_FILE" '
       function hx(s,  n,i,c){ n=0; s=toupper(s);
@@ -108,21 +135,21 @@ parse_adverts() {
 }
 
 # --- startup ------------------------------------------------------------
-LOG yellow "Flock-You v9.18 (wardrive) started at $(date)"
+LOG yellow "Flock-You v9.19 (wardrive) started at $(date)"
 LOG "Near-continuous scan + all-advert diagnostic log."
 LOG "Signal key:"
-LOG magenta "  MANUF  XUNTONG 0x09C8 (strongest)"
-LOG yellow  "  OUI    MAC prefix match"
+LOG magenta "  MANUF  XUNTONG 0x09C8"
+LOG yellow  "  OUI    MAC prefix match (catches Falcon)"
 LOG cyan    "  NAME   BLE name match"
 LOG "----------------------------------"
-echo "v9.18 started at $(date)" > "$LOG_FILE"
+echo "v9.19 started at $(date)" > "$LOG_FILE"
 echo "time,mac,name_or_label,signals,rssi,lat,lon" > "$CSV_FILE"
 echo "time,mac,manuf_id,rssi,name" > "$ALLADV_FILE"
 
-# One-time adapter bring-up (not per-cycle - that was the biggest scan gap).
 hciconfig hci0 down 2>>"$LOG_FILE"
 hciconfig hci0 reset 2>>"$LOG_FILE"
 hciconfig hci0 up 2>>"$LOG_FILE"
+stop_le_scan
 
 DETECTIONS=0
 COUNTER=0
@@ -134,15 +161,16 @@ while true; do
     DUMP_PID=$!
     timeout 11 hcitool lescan --duplicates > "$SCAN_FILE" 2>>"$LOG_FILE" &
     SCAN_PID=$!
-    sleep 8                                   # active scan window
+    sleep 8
     kill $SCAN_PID 2>/dev/null; kill $DUMP_PID 2>/dev/null
     wait $SCAN_PID 2>/dev/null; wait $DUMP_PID 2>/dev/null
+    stop_le_scan            # <- clears scan state; prevents I/O-error flood
 
-    # Adaptive recovery: if the adapter captured nothing for 2 cycles, reset it.
     if [ ! -s "$RAW_FILE" ]; then
         EMPTY_STREAK=$((EMPTY_STREAK + 1))
         if [ "$EMPTY_STREAK" -ge 2 ]; then
             hciconfig hci0 down 2>>"$LOG_FILE"; hciconfig hci0 reset 2>>"$LOG_FILE"; hciconfig hci0 up 2>>"$LOG_FILE"
+            stop_le_scan
             EMPTY_STREAK=0
         fi
         continue
@@ -150,28 +178,19 @@ while true; do
     EMPTY_STREAK=0
 
     CYCLE_GPS="$(get_gps_fix)"
-    DIAG_TIME="$(date '+%Y-%m-%d %H:%M:%S')"
-    CURRENT_TIME="$(date '+%H:%M:%S')"
     if [ -n "$CYCLE_GPS" ]; then GPS_TAG="$CYCLE_GPS"; CSV_LAT="${CYCLE_GPS%,*}"; CSV_LON="${CYCLE_GPS#*,}";
     else GPS_TAG="NO_GPS"; CSV_LAT=""; CSV_LON=""; fi
 
     parse_adverts > "$ADV_FILE"
 
-    # Main-shell loop (redirect, not pipe) so dedup + counters persist.
+    # ---- FLOCK HITS FIRST (few rows) so the alert is immediate ----------
+    awk -F'|' '$4 != ""' "$ADV_FILE" > "$HIT_FILE"
     while IFS='|' read -r MAC MANUF RSSI TAGS LABEL NAME; do
         [ -z "$MAC" ] && continue
-
-        # Diagnostic: log every MAC once per run.
-        if ! grep -qx "$MAC" "$ALLSEEN_FILE" 2>/dev/null; then
-            echo "$MAC" >> "$ALLSEEN_FILE"
-            echo "${DIAG_TIME},${MAC},${MANUF},${RSSI},\"${NAME}\"" >> "$ALLADV_FILE"
-        fi
-
-        # Detection: only MACs with a Flock signal, once per run.
-        [ -z "$TAGS" ] && continue
-        if grep -qx "$MAC" "$SEEN_FILE" 2>/dev/null; then continue; fi
+        grep -qx "$MAC" "$SEEN_FILE" 2>/dev/null && continue
         echo "$MAC" >> "$SEEN_FILE"
 
+        CURRENT_TIME=$(date '+%H:%M:%S')     # per-detection, not per-cycle
         DESC="${LABEL:-${NAME:-$TAGS}}"
         ENTRY="DECT: $CURRENT_TIME | $MAC | $TAGS | $DESC | RSSI:$RSSI | $GPS_TAG"
         case "$TAGS" in
@@ -183,19 +202,45 @@ while true; do
         echo "$ENTRY" >> "$LOG_FILE"
         echo "${CURRENT_TIME},${MAC},\"${DESC}\",\"${TAGS}\",${RSSI},${CSV_LAT},${CSV_LON}" >> "$CSV_FILE"
 
-        DETECTIONS=$((DETECTIONS + 1))
-        COUNTER=$((COUNTER + 1))
+        DETECTIONS=$((DETECTIONS + 1)); COUNTER=$((COUNTER + 1))
         if [ $((COUNTER % 10)) -eq 0 ]; then
             LOG " "; LOG magenta "MANUF XUNTONG"; LOG yellow "OUI match"; LOG cyan "NAME match"; LOG " "
         fi
 
+        # Alert: buzz + LED, immediately.
         if [ -f /sys/class/gpio/vibrator/value ]; then
-            echo 1 > /sys/class/gpio/vibrator/value 2>/dev/null; sleep 0.15; echo 0 > /sys/class/gpio/vibrator/value 2>/dev/null
+            echo 1 > /sys/class/gpio/vibrator/value 2>/dev/null; sleep 0.15
+            echo 0 > /sys/class/gpio/vibrator/value 2>/dev/null
         fi
-        if ls /sys/class/leds/* >/dev/null 2>&1; then
-            LED=$(ls /sys/class/leds/* | head -1)
-            echo 1 > "${LED}/brightness" 2>/dev/null; sleep 0.3; echo 0 > "${LED}/brightness" 2>/dev/null
+        if [ -d /sys/class/leds/buzzer ]; then
+            echo 1 > /sys/class/leds/buzzer/brightness 2>/dev/null; sleep 0.2
+            echo 0 > /sys/class/leds/buzzer/brightness 2>/dev/null
         fi
-    done < "$ADV_FILE"
+        if [ -d /sys/class/leds/a-button-led ]; then
+            echo 1 > /sys/class/leds/a-button-led/brightness 2>/dev/null; sleep 0.2
+            echo 0 > /sys/class/leds/a-button-led/brightness 2>/dev/null
+        fi
+    done < "$HIT_FILE"
+
+    # ---- BULK DIAGNOSTIC (many rows) - single awk pass, O(n) ------------
+    # Appends new MACs to ALLSEEN_FILE and their rows to ALLADV_FILE.
+    # getline (not NR==FNR) so an empty/missing seen-file behaves correctly.
+    DIAG_TIME="$(date '+%Y-%m-%d %H:%M:%S')"
+    # NOTE: awk cannot reliably append to a file it also read with getline
+    # (the write is lost), so new MACs go to a temp file and are concatenated
+    # afterwards. Errors are NOT suppressed - a silent awk failure here once
+    # cost a whole test run.
+    awk -F'|' -v seenfile="$ALLSEEN_FILE" -v newout="$NEWSEEN_FILE" -v ts="$DIAG_TIME" '
+      BEGIN{ while((getline l < seenfile) > 0) seen[l]=1 }
+      {
+        if($1 != "" && !($1 in seen)){
+          seen[$1]=1
+          print $1 > newout
+          printf "%s,%s,%s,%s,\"%s\"\n", ts, $1, $2, $3, $6
+        }
+      }
+    ' "$ADV_FILE" >> "$ALLADV_FILE" 2>>"$LOG_FILE"
+    [ -s "$NEWSEEN_FILE" ] && cat "$NEWSEEN_FILE" >> "$ALLSEEN_FILE"
+    : > "$NEWSEEN_FILE"
 done
 exit 0

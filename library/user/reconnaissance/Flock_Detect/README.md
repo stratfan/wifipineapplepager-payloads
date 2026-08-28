@@ -17,6 +17,23 @@ BLE range is short (~10–30 m). Driving past a pole camera you're in range for 
 
 > **BLE vs WiFi for cameras.** A Falcon *camera* is primarily a WiFi device; the confirmed BLE emitters are the Penguin battery and Pigvision. For mapping cameras while driving, the WiFi path (`wardrive_activate` → WiGLE, then `loot/flock_hits.sh` OUI matching) is more reliable. Run both.
 
+### Field results and v9.19 fixes
+
+A real drive-by confirmed detection works — a Falcon was caught by its **OUI**, with **zero XUNTONG `0x09C8` seen across 1,477 devices**. On this hardware the OUI list, not the manufacturer ID, is what finds Falcons.
+
+That drive also exposed three defects, fixed in v9.19:
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Log flooded with `Set scan parameters failed: I/O error` (786 in one run) | Killing `lescan` leaves LE scanning enabled, so the next cycle can't set scan params | Explicit `LE Set Scan Enable=0` between cycles (fast — keeps the duty cycle) |
+| Alert buzzed ~30 min after the sighting | Per-device dedup grepped a growing seen-file — O(n²), **measured 79 s per cycle** at 1,477 devices | Single awk pass (**~0 ms**); Flock hits processed *before* the bulk diagnostic write |
+| Detection timestamps stale by minutes | Timestamp computed once per cycle | Timestamp taken at the moment of detection |
+
+**Two platform traps worth knowing** (both cost real debugging time):
+
+- The Pager UI runs a payload from a **copy at `/tmp/payload-<id>.sh`** — so `pkill -f '<name>/payload.sh'` never matches a UI-launched instance, and a payload left running from an earlier session is easy to miss. It will hold the BT adapter and skew any test.
+- This payload deliberately has **no EXIT/TERM trap**. Background subshells (`hcidump ... &`) inherit an EXIT trap and would delete the live dedup state every cycle; and a TERM trap makes the payload *survive* being killed (bash resumes the loop after a trapped signal), leaving immortal instances fighting over the adapter. Temp files are per-instance (`$$`) and cleaned at startup instead.
+
 ### Detection: three signals (v9.17+)
 
 Earlier versions matched only the BLE **device name**. Most real Flock adverts carry *no name* (they broadcast a MAC + manufacturer data), so name-only detection missed them. v9.17 checks three signals and alerts if **any** fire:
